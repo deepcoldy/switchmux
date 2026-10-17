@@ -33,6 +33,7 @@ final class AppBarItemView: NSView {
         self.slotKey = slot.key
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.masksToBounds = false
 
         iconView.image = slot.icon
         iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -50,6 +51,8 @@ final class AppBarItemView: NSView {
         badgeView.layer?.backgroundColor = NSColor(white: 0.17, alpha: 0.88).cgColor
         badgeView.layer?.borderWidth = 0.5
         badgeView.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        // Sibling of the icon. Its frame never intersects the icon's, so the
+        // image layer cannot cover any part of it.
         addSubview(badgeView)
 
         badgeLabel.font = .systemFont(ofSize: metrics.badgeFontSize, weight: .semibold)
@@ -86,13 +89,20 @@ final class AppBarItemView: NSView {
                                 width: m.iconSize, height: m.iconSize)
 
         let badgeSize = badgeLabel.stringValue.count > 1 ? m.badgeWidthWide : m.badgeWidth
-        badgeView.frame = NSRect(x: iconView.frame.minX - m.badgeOverlap,
-                                 y: iconView.frame.minY - m.badgeOverlap,
-                                 width: badgeSize, height: m.badgeHeight)
+        // Key badge sits inside the icon's lower-left corner. It stays a
+        // sibling view fully within both the tile and icon horizontal/vertical
+        // bounds (small inset): crossing the icon's leading edge gets clipped
+        // by the image backing layer, while an in-bounds overlapping sibling
+        // composites correctly.
+        badgeView.frame = NSRect(
+            x: m.badgeInset,
+            y: iconView.frame.minY + m.badgeInset,
+            width: badgeSize, height: m.badgeHeight)
         badgeLabel.frame = NSRect(x: 0, y: (m.badgeHeight - m.badgeFontSize) / 2 - 1,
                                   width: badgeSize, height: m.badgeFontSize + 2)
         dotView.frame = NSRect(x: (bounds.width - m.dotSize) / 2, y: 0,
                                width: m.dotSize, height: m.dotSize)
+        // Badge is a child of iconView; no reordering needed.
         updateChrome()
     }
 

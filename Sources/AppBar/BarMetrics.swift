@@ -23,7 +23,8 @@ struct BarMetrics {
     var badgeWidth: CGFloat { 22 * scale }
     var badgeWidthWide: CGFloat { 34 * scale }
     var badgeFontSize: CGFloat { 12 * scale }
-    var badgeOverlap: CGFloat { 7 * scale }
+    /// Key badge inset from the icon's lower-left corner.
+    var badgeInset: CGFloat { 5 * scale }
 
     static var current: BarMetrics { BarMetrics(scale: CGFloat(SettingsStore.shared.barSizeScale)) }
 
