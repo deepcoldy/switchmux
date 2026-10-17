@@ -1,0 +1,16 @@
+# Build outputs
+/build/
+*.app
+*.xcodeproj
+*.xcworkspace
+
+# macOS
+.DS_Store
+
+# SPM
+.swiftpm/
+.build/
+
+# Local / temp
+*.log
+*.tmp
