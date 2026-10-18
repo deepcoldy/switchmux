@@ -14,3 +14,6 @@
 # Local / temp
 *.log
 *.tmp
+
+# Local code-signing material (keys/certs — never commit)
+signing/
