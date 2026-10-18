@@ -47,8 +47,8 @@ jobs:
           asc auth login --name ci \
             --key-id "$ASC_KEY_ID" \
             --issuer-id "$ASC_ISSUER_ID" \
-            --private-key "$ASC_PRIVATE_KEY" \
-            --bypass-keychain --skip-validation
+            --private-key ".asc-work/AuthKey.p8" \
+            --bypass-keychain --network
           printf '%s' "$ASC_CERT_PASSWORD" > .asc-work/p12.pass
           printf '%s' "$ASC_CERT_BASE64" | base64 -d > .asc-work/DeveloperID.p12
 
