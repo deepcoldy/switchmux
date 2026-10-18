@@ -8,10 +8,15 @@
 //
 // Usage:
 //   SwitchMuxCaptureHelper probe
-//       -> prints "granted" or "denied" by capturing any on-screen window.
+//       -> prints "granted" or "denied" via CGPreflightScreenCaptureAccess.
+//          NEVER performs a real capture: an actual CGWindowListCreateImage
+//          while unauthorized re-posts the system TCC alert every time, and
+//          the settings pane polls this command on a timer.
 //   SwitchMuxCaptureHelper capture <outputDir>
 //       -> reads a JSON array [{id,x,y,w,h}] from stdin, writes <id>.png for
 //          each NON-BLANK capture, prints one JSON result per line.
+//          Bails out (all results ok:false) when Screen Recording is not
+//          granted, so summoning the switcher can never trigger the prompt.
 
 import AppKit
 import CoreGraphics
@@ -61,40 +66,23 @@ func capture(_ job: CaptureJob) -> CGImage? {
     )
 }
 
-func firstOnScreenWindow() -> CGWindowID? {
-    guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
-        return nil
-    }
-    for info in raw {
-        let layer = info[kCGWindowLayer as String] as? Int ?? 0
-        let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
-        guard layer == 0, alpha > 0.9 else { continue }
-        if let b = info[kCGWindowBounds as String] as? [String: CGFloat],
-           let w = b["Width"], let h = b["Height"], w > 300, h > 200,
-           let num = info[kCGWindowNumber as String] as? Int,
-           let pid = info[kCGWindowOwnerPID as String] as? pid_t,
-           pid != ProcessInfo.processInfo.processIdentifier {
-            return CGWindowID(num)
-        }
-    }
-    return nil
-}
-
 let args = CommandLine.arguments
 
 if args.count >= 2 && args[1] == "probe" {
-    if let id = firstOnScreenWindow(),
-       let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, id,
-                                       [.boundsIgnoreFraming, .bestResolution]),
-       cg.width > 8, cg.height > 8, !blank(cg) {
-        print("granted")
-    } else {
-        print("denied")
-    }
+    // Preflight answers without posting the TCC alert. The fresh process
+    // sees the current grant state, so the pane flips green right after the
+    // user enables access — no app restart needed.
+    print(CGPreflightScreenCaptureAccess() ? "granted" : "denied")
     exit(0)
 }
 
 if args.count >= 3 && args[1] == "capture" {
+    // Gate the whole batch: capturing without a grant posts the TCC alert,
+    // and the switcher is summoned on every hotkey press.
+    guard CGPreflightScreenCaptureAccess() else {
+        FileHandle.standardError.write(Data("screen recording not granted\n".utf8))
+        exit(0)
+    }
     let outDir = URL(fileURLWithPath: args[2], isDirectory: true)
     try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
     let input = FileHandle.standardInput.readDataToEndOfFile()
