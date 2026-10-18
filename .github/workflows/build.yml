@@ -168,8 +168,10 @@ jobs:
         run: |
           set -euo pipefail
           asc notarization submit --file "build/$APP_NAME.dmg" --wait
-          asc notarization staple --file "build/$APP_NAME.dmg" --confirm
-          asc notarization validate --file "build/$APP_NAME.dmg"
+          # Use Apple's stapler directly: asc's staple re-check after writing
+          # falsely reports the artifact changed and exits non-zero.
+          xcrun stapler staple "build/$APP_NAME.dmg"
+          xcrun stapler validate "build/$APP_NAME.dmg"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
