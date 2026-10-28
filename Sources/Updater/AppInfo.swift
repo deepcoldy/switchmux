@@ -25,12 +25,15 @@ enum AppInfo {
     static let releasesWebURL = URL(string: "https://github.com/deepcoldy/switchmux/releases/latest")!
 
     /// Team ID embedded in the on-disk running app's signature; nil for ad-hoc builds.
+    /// The kSecCSSigningInformation flag is required, otherwise the signing
+    /// info dictionary omits the certificate chain and team identifier.
     static var runningTeamIdentifier: String? {
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &staticCode) == errSecSuccess,
               let staticCode else { return nil }
         var info: CFDictionary?
-        guard SecCodeCopySigningInformation(staticCode, [], &info) == errSecSuccess,
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(staticCode, flags, &info) == errSecSuccess,
               let dict = info as? [String: Any] else { return nil }
         return dict[kSecCodeInfoTeamIdentifier as String] as? String
     }
