@@ -79,6 +79,24 @@ final class StatusBarController: NSObject {
             menu.addItem(.separator())
         }
 
+        // Update status: one-click install when ready, progress while downloading.
+        switch UpdateChecker.shared.state {
+        case .ready(let pending):
+            menu.addItem(.separator())
+            let install = NSMenuItem(title: "↻ 重启以安装更新 v\(pending.version)",
+                                     action: #selector(installUpdate), keyEquivalent: "")
+            install.target = self
+            menu.addItem(install)
+        case .downloading(let release, _):
+            menu.addItem(.separator())
+            let item = NSMenuItem(title: "正在下载更新 \(release.title)…",
+                                  action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        default:
+            break
+        }
+
         let prefsItem = NSMenuItem(title: "设置…", action: #selector(openPreferences), keyEquivalent: ",")
         prefsItem.target = self
         menu.addItem(prefsItem)
@@ -86,6 +104,11 @@ final class StatusBarController: NSObject {
         let welcomeItem = NSMenuItem(title: "欢迎页", action: #selector(showWelcome), keyEquivalent: "")
         welcomeItem.target = self
         menu.addItem(welcomeItem)
+
+        let checkUpdatesItem = NSMenuItem(title: "检查更新…", action: #selector(checkForUpdates),
+                                          keyEquivalent: "")
+        checkUpdatesItem.target = self
+        menu.addItem(checkUpdatesItem)
 
         menu.addItem(.separator())
 
@@ -128,6 +151,15 @@ final class StatusBarController: NSObject {
 
     @objc private func showWelcome() {
         WelcomeWindowController.shared.showWindow()
+    }
+
+    @objc private func checkForUpdates() {
+        PreferencesWindowController.shared.showWindow(.about)
+        UpdateChecker.shared.checkNow(mode: .manual)
+    }
+
+    @objc private func installUpdate() {
+        UpdateChecker.shared.installPending()
     }
 
     @objc private func quit() {

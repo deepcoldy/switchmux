@@ -33,6 +33,8 @@ struct SettingsSnapshot: Codable {
     var usageByDay: [String: Int]
     var welcomeShown: Bool
     var showStatusIcon: Bool
+    // Optional so adding it does not break decoding of older synced configs.
+    var autoUpdateCheck: Bool?
 }
 
 /// All user-facing settings. Persistence is a single JSON snapshot kept by
@@ -105,6 +107,7 @@ final class SettingsStore: ObservableObject {
     @Published var usageByDay: [String: Int]
     @Published var welcomeShown: Bool
     @Published var showStatusIcon: Bool
+    @Published var autoUpdateCheck: Bool
 
     var launchAtLogin: Bool {
         get { SMAppService.mainApp.status == .enabled }
@@ -155,6 +158,7 @@ final class SettingsStore: ObservableObject {
         usageByDay = [:]
         welcomeShown = false
         showStatusIcon = true
+        autoUpdateCheck = true
 
         // JSON snapshot (iCloud Drive / Application Support) wins if present.
         if let snap = ConfigSync.shared.load(SettingsSnapshot.self) {
@@ -221,7 +225,8 @@ final class SettingsStore: ObservableObject {
             usageCount: usageCount,
             usageByDay: usageByDay,
             welcomeShown: welcomeShown,
-            showStatusIcon: showStatusIcon
+            showStatusIcon: showStatusIcon,
+            autoUpdateCheck: autoUpdateCheck
         )
     }
 
@@ -255,6 +260,7 @@ final class SettingsStore: ObservableObject {
         usageByDay = s.usageByDay
         welcomeShown = s.welcomeShown
         showStatusIcon = s.showStatusIcon
+        autoUpdateCheck = s.autoUpdateCheck ?? true
     }
 
     // MARK: Profile mutations

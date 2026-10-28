@@ -57,7 +57,7 @@ struct GeneralPane: View {
                 }
             }
             Section {
-                Text("SwitchMux 1.0.0（应用与窗口快速切换器）")
+                Text("SwitchMux \(AppInfo.shortVersion)（应用与窗口快速切换器）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -54,6 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             WelcomeWindowController.shared.showWindow()
         }
 
+        // Auto-update checks (daily, with launch jitter); no UI unless a
+        // downloadable release is found.
+        UpdateChecker.shared.start()
+
         // Debug hook: SWITCHMUX_KEYTEST=1 shows the bar via synthetic Option and
         // posts Option+1 from inside the (Accessibility-trusted) app process.
         if ProcessInfo.processInfo.environment["SWITCHMUX_KEYTEST"] != nil {
