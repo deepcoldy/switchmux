@@ -22,6 +22,13 @@ final class WindowSwitcherController {
     private init() {}
 
     // MARK: Show / hide
+    /// Show the overlay and advance the selection once. Invoked when the
+    /// trigger chord has been held long enough to commit to our switcher.
+    func present(forward: Bool) {
+        show()
+        if isVisible { move(forward: forward) }
+    }
+
     func show() {
         guard !isVisible else { return }
         let s = SettingsStore.shared
@@ -59,16 +66,9 @@ final class WindowSwitcherController {
     // MARK: Keyboard
     /// Returns true when the event was swallowed.
     func handleKey(_ event: NSEvent) -> Bool {
-        // Before the overlay exists, only the trigger key (Tab) arms it —
-        // this keeps ordinary modifier shortcuts untouched.
-        if !isVisible {
-            if event.keyCode == 48 {
-                show()
-                if isVisible { move(forward: !event.modifierFlags.contains(.shift)) }
-                return true
-            }
-            return false
-        }
+        // Before the overlay exists the HotkeyController owns the trigger:
+        // a quick Tab is forwarded to the native switcher, a held Tab shows us.
+        if !isVisible { return false }
         switch event.keyCode {
         case 48: // Tab
             move(forward: !event.modifierFlags.contains(.shift))

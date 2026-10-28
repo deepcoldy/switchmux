@@ -6,18 +6,25 @@ import CoreGraphics
 /// Creation fails (returns nil) until Accessibility is granted; call
 /// `ensureStarted()` again after the grant flips — no app restart needed.
 final class HotkeyEventTap {
+    /// Events we synthesize (quick-chord passthrough) tag themselves with this
+    /// value so our own tap can recognise and never re-swallow them.
+    static let syntheticUserData: Int64 = 0x534D55_58 // "SMU-X"
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private(set) var isActive = false
 
     /// Called on the main thread. Return true to swallow the event.
     var onKeyDown: ((NSEvent) -> Bool)?
+    var onKeyUp: ((NSEvent) -> Bool)?
     var onFlagsChanged: ((NSEvent.ModifierFlags) -> Void)?
 
     func start() {
         stop()
         let eventMask: CGEventMask =
-            (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+            (1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue)
+            | (1 << CGEventType.flagsChanged.rawValue)
 
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
@@ -63,6 +70,10 @@ final class HotkeyEventTap {
         guard let event = NSEvent(cgEvent: cgEvent) else {
             return Unmanaged.passUnretained(cgEvent)
         }
+        // Bypass our own re-posted synthetic events entirely.
+        if cgEvent.getIntegerValueField(.eventSourceUserData) == Self.syntheticUserData {
+            return Unmanaged.passUnretained(cgEvent)
+        }
         if ProcessInfo.processInfo.environment["SWITCHMUX_TRACE"] != nil {
             NSLog("TRACE raw type=\(type.rawValue) ch=\(event.charactersIgnoringModifiers ?? "-")")
         }
@@ -77,6 +88,10 @@ final class HotkeyEventTap {
                 NSLog("TRACE keyDown \(event.charactersIgnoringModifiers ?? "?") flags=\(event.modifierFlags.rawValue)")
             }
             if onKeyDown?(event) == true {
+                return nil // swallow
+            }
+        case .keyUp:
+            if onKeyUp?(event) == true {
                 return nil // swallow
             }
         default:
