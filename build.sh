@@ -82,6 +82,15 @@ codesign --force --sign - --identifier "$BUNDLE_ID.capture-helper" \
   "$APP/Contents/MacOS/SwitchMuxCaptureHelper"
 codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
 
+# Re-sign with the Developer ID certificate when its password is stored, so
+# macOS keeps the existing Accessibility / Screen Recording grants.
+if [ "${SWITCHMUX_ADHOC:-}" = "" ] \
+   && security find-generic-password -s "SwitchMux signing p12" >/dev/null 2>&1; then
+  echo "==> Developer ID signing"
+  "$ROOT/scripts/sign-local.sh" "$APP" </dev/null \
+    || echo "    (Developer ID signing failed; the build stays ad-hoc signed)"
+fi
+
 echo ""
 echo "Build complete: $APP"
 echo "Run: open \"$APP\"   (then grant Accessibility in System Settings)"

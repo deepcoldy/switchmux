@@ -5,7 +5,11 @@
 #
 # Usage:
 #   scripts/sign-local.sh [path/to/SwitchMux.app] [path/to/DeveloperID.p12]
-#   (prompts for the .p12 password; SWITCHMUX_P12 overrides the .p12 path)
+#   (SWITCHMUX_P12 overrides the .p12 path)
+#
+# The .p12 password is read from the login keychain item "SwitchMux signing
+# p12" if present (store it once with scripts/sign-local.sh --save-password),
+# otherwise prompted for. ./build.sh signs automatically once it is stored.
 #
 # The .p12 is imported into a throwaway keychain that is deleted on exit; the
 # login keychain and its search list are left as they were. The password is
@@ -13,6 +17,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+KEYCHAIN_SERVICE="SwitchMux signing p12"
+
+if [ "${1:-}" = "--save-password" ]; then
+  # -w as the last argument makes `security` prompt for the value itself, so
+  # the password never appears in argv or shell history.
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" \
+    -j "Import password of the Developer ID .p12 used by switchmux/scripts/sign-local.sh" -w
+  echo "Saved to the login keychain as \"$KEYCHAIN_SERVICE\"."
+  exit 0
+fi
 APP="${1:-$ROOT/build/SwitchMux.app}"
 P12="${2:-${SWITCHMUX_P12:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/开发者证书/Apple签名-8VP93PY3E9/developer-id-application.p12}}"
 TEAM_ID="8VP93PY3E9"
@@ -24,7 +39,10 @@ if ! head -c 1 "$P12" >/dev/null 2>&1; then
   exit 1
 fi
 
-read -r -s -p "Password for $(basename "$P12"): " PASS; echo
+if ! PASS="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
+  [ -t 0 ] || { echo "No stored .p12 password; run scripts/sign-local.sh --save-password first." >&2; exit 1; }
+  read -r -s -p "Password for $(basename "$P12"): " PASS; echo
+fi
 
 WORK="$(mktemp -d)"
 KC="$WORK/switchmux-sign.keychain-db"

@@ -131,9 +131,10 @@ To keep the grants of the installed release, re-sign the local build with the
 Developer ID certificate (same team → same designated requirement):
 
 ```bash
-./build.sh
-scripts/sign-local.sh                       # prompts for the .p12 password
-# another .p12: SWITCHMUX_P12=path/to/DeveloperID.p12 scripts/sign-local.sh
+scripts/sign-local.sh --save-password       # once: stores the .p12 password in the login keychain
+./build.sh                                  # now signs with Developer ID automatically
+# manual / other .p12: SWITCHMUX_P12=path/to/DeveloperID.p12 scripts/sign-local.sh
+# force ad-hoc:        SWITCHMUX_ADHOC=1 ./build.sh
 ```
 
 The `.p12` is imported into a temporary keychain that is deleted afterwards.
