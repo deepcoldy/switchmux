@@ -124,7 +124,19 @@ identities and codesigning silently falls back to ad-hoc.
 ## Local development
 
 `./build.sh` produces an ad-hoc signed `build/SwitchMux.app` — fine for local
-use, no Apple credentials needed.
+use, no Apple credentials needed. macOS treats an ad-hoc build as a different
+app, though, so Accessibility / Screen Recording must be granted again.
+
+To keep the grants of the installed release, re-sign the local build with the
+Developer ID certificate (same team → same designated requirement):
+
+```bash
+./build.sh
+scripts/sign-local.sh                       # prompts for the .p12 password
+# another .p12: SWITCHMUX_P12=path/to/DeveloperID.p12 scripts/sign-local.sh
+```
+
+The `.p12` is imported into a temporary keychain that is deleted afterwards.
 
 ## Backing up the private key
 

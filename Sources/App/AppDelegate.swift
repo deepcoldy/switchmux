@@ -6,6 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBar: StatusBarController?
     private var cancellables = Set<AnyCancellable>()
 
+    private var hotkeysWanted: Bool {
+        ProcessInfo.processInfo.environment["SWITCHMUX_NO_HOTKEYS"] == nil
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A crashed earlier instance may have left system ⌘Tab disabled;
         // make sure it comes back however we exit.
@@ -48,9 +52,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
         PermissionWatcher.shared.start()
-        if !PermissionWatcher.shared.trusted {
+        if !PermissionWatcher.shared.trusted && hotkeysWanted {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                // Registers SwitchMux in the Accessibility list (toggle off)
+                // and shows the system alert.
                 PermissionWatcher.shared.systemPrompt()
+                // Returning users (e.g. after an update re-signed the app) get
+                // the docked drag guide right away; first-run users get it
+                // from the welcome window.
+                if SettingsStore.shared.welcomeShown {
+                    PrefsSupport.guideToAccessibility()
+                }
             }
         }
 

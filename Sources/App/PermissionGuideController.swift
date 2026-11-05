@@ -3,81 +3,148 @@ import SwiftUI
 import ApplicationServices
 import Combine
 
-/// Compact always-on-top guide shown beside System Settings while the user
-/// grants Accessibility: app icon, drag instructions, reveal-in-Finder action,
-/// live grant state, auto-dismiss.
+/// Which privacy list the guide is helping with.
+enum PermissionKind {
+    case accessibility
+    case screenRecording
+
+    var listName: String {
+        switch self {
+        case .accessibility: return "辅助功能"
+        case .screenRecording: return "屏幕与系统录音"
+        }
+    }
+}
+
+/// Floating guide that docks to the System Settings window while the user
+/// grants a permission (Codex-style): a draggable SwitchMux icon to drop
+/// straight into the list, short steps, live grant state, auto-dismiss.
 final class PermissionGuideController {
     static let shared = PermissionGuideController()
 
     private var panel: NSPanel?
-    private var hosting: NSHostingView<PermissionGuideView>?
     private let model = PermissionGuideModel()
-    private var repositionTimer: Timer?
-    private var dismissWorkItem: DispatchWorkItem?
+    private var timer: Timer?
+    private var dismissWork: DispatchWorkItem?
+    private var cancellables = Set<AnyCancellable>()
+    private var screenRecordingProbeInFlight = false
+
+    private let size = NSSize(width: 440, height: 160)
 
     private init() {
         PermissionWatcher.shared.changePublisher
             .receive(on: RunLoop.main)
-            .sink { [weak self] trusted in
-                self?.model.trusted = trusted
-                if trusted { self?.scheduleDismiss() }
-            }
+            .sink { [weak self] _ in self?.refreshGrant() }
             .store(in: &cancellables)
     }
-    private var cancellables = Set<AnyCancellable>()
 
-    func show() {
-        model.trusted = PrefsSupport.accessibilityTrusted
-        if model.trusted { return }
+    var isVisible: Bool { panel?.isVisible == true }
+
+    private var showGeneration = 0
+
+    func show(_ kind: PermissionKind = .accessibility) {
+        showGeneration += 1
+        model.kind = kind
+        model.granted = false
+        refreshGrant()
+        if model.granted && kind == .accessibility { return }
 
         if panel == nil { buildPanel() }
         guard let panel else { return }
-        dismissWorkItem?.cancel()
-        positionPanel()
+        dismissWork?.cancel()
+        position(animated: false)
         panel.alphaValue = 0
         panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.18; panel.animator().alphaValue = 1 }
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.2; panel.animator().alphaValue = 1 }
 
-        repositionTimer?.invalidate()
-        repositionTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
-            self?.positionPanel()
-        }
+        timer?.invalidate()
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     func hide() {
-        dismissWorkItem?.cancel()
-        repositionTimer?.invalidate()
-        NSAnimationContext.runAnimationGroup({ [weak panel] ctx in
+        dismissWork?.cancel()
+        timer?.invalidate()
+        timer = nil
+        guard let panel else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
-            panel?.animator().alphaValue = 0
+            panel.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            self?.panel?.orderOut(nil)
+            guard self?.timer == nil else { return }
+            panel.orderOut(nil)
         })
     }
 
-    private func scheduleDismiss() {
-        dismissWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.hide() }
-        dismissWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: work)
+    // MARK: State
+    private var tickCount = 0
+    private func tick() {
+        tickCount += 1
+        position(animated: true)
+        // Accessibility is cheap to query; Screen Recording needs the helper.
+        if model.kind == .accessibility || tickCount % 4 == 0 { refreshGrant() }
     }
 
+    private func refreshGrant() {
+        switch model.kind {
+        case .accessibility:
+            setGranted(PrefsSupport.accessibilityTrusted)
+        case .screenRecording:
+            guard WindowCapture.isAvailable, !screenRecordingProbeInFlight else {
+                if !WindowCapture.isAvailable { setGranted(ScreenCapturePermission.status) }
+                return
+            }
+            screenRecordingProbeInFlight = true
+            let generation = showGeneration
+            WindowCapture.probe { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.screenRecordingProbeInFlight = false
+                    // Ignore a probe that started before the guide was re-shown
+                    // (possibly for the other permission).
+                    guard self.showGeneration == generation, self.model.kind == .screenRecording else { return }
+                    self.setGranted(granted)
+                }
+            }
+        }
+    }
+
+    private func setGranted(_ granted: Bool) {
+        guard granted != model.granted else { return }
+        model.granted = granted
+        if granted {
+            dismissWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.hide() }
+            dismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+        }
+    }
+
+    // MARK: Panel
     private func buildPanel() {
-        let view = PermissionGuideView(model: model,
-                                       reveal: { PrefsSupport.revealAppInFinder() },
-                                       reopenSettings: { PrefsSupport.openAccessibilitySettings() },
-                                       close: { [weak self] in self?.hide() })
-        let size = NSSize(width: 348, height: 184)
+        let view = PermissionGuideView(
+            model: model,
+            reopenSettings: { [weak self] in
+                guard let self else { return }
+                switch self.model.kind {
+                case .accessibility: PrefsSupport.openAccessibilitySettings()
+                case .screenRecording: PrefsSupport.openScreenRecordingSettings()
+                }
+            },
+            reveal: { PrefsSupport.revealAppInFinder() },
+            reset: { PermissionWatcher.shared.resetAndReRegister() },
+            close: { [weak self] in self?.hide() })
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(origin: .zero, size: size)
 
         let effect = NSVisualEffectView(frame: host.bounds)
         effect.autoresizingMask = [.width, .height]
-        effect.material = .hudWindow
-        effect.blendingMode = .withinWindow
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 16
+        effect.layer?.cornerRadius = 14
         effect.layer?.cornerCurve = .continuous
         effect.layer?.masksToBounds = true
         effect.addSubview(host)
@@ -89,165 +156,220 @@ final class PermissionGuideController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.isMovable = true
-        panel.isMovableByWindowBackground = true
+        panel.isMovable = false
         panel.hidesOnDeactivate = false
-        panel.animationBehavior = .default
+        panel.animationBehavior = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentView = effect
         self.panel = panel
-        self.hosting = host
     }
 
-    // MARK: Placement beside the System Settings window
-    private func positionPanel() {
+    /// Docks under the System Settings window (inside its bottom edge if
+    /// there's no room below), so the icon sits right below the list it must
+    /// be dropped into. Falls back to the top-right of the main screen.
+    private func position(animated: Bool) {
         guard let panel else { return }
-        let size = panel.frame.size
-        let margin: CGFloat = 16
-
-        if let settingsFrame = settingsWindowFrame(),
-           let screen = NSScreen.screens.first(where: { $0.frame.intersects(settingsFrame) }) {
+        var origin: NSPoint
+        if let settings = Self.settingsWindowFrame(),
+           let screen = NSScreen.screens.first(where: { $0.frame.intersects(settings) }) ?? NSScreen.main {
             let vf = screen.visibleFrame
-            var origin = NSPoint()
-            // Prefer right of Settings; fall back to left; else top-trailing.
-            if settingsFrame.maxX + margin + size.width <= vf.maxX {
-                origin.x = settingsFrame.maxX + margin
-            } else if settingsFrame.minX - margin - size.width >= vf.minX {
-                origin.x = settingsFrame.minX - margin - size.width
-            } else {
-                origin.x = vf.maxX - size.width - margin
+            let gap: CGFloat = 10
+            origin = NSPoint(x: settings.midX - size.width / 2, y: settings.minY - size.height - gap)
+            if origin.y < vf.minY + 8 {
+                origin.y = settings.minY + 16   // overlap the bottom of the window instead
             }
-            origin.y = min(max(settingsFrame.midY - size.height / 2, vf.minY + margin),
-                           vf.maxY - size.height - margin)
-            panel.setFrameOrigin(origin)
-            return
+            origin.x = min(max(origin.x, vf.minX + 8), vf.maxX - size.width - 8)
+            model.docked = true
+        } else {
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+            let vf = screen.visibleFrame
+            origin = NSPoint(x: vf.maxX - size.width - 16, y: vf.maxY - size.height - 16)
+            model.docked = false
         }
+        let target = NSRect(origin: origin, size: size)
+        guard panel.frame != target else { return }
+        panel.setFrame(target, display: true, animate: animated && panel.isVisible)
+    }
 
-        guard let main = NSScreen.main ?? NSScreen.screens.first else { return }
-        let vf = main.visibleFrame
-        panel.setFrameOrigin(NSPoint(x: vf.maxX - size.width - margin,
-                                    y: vf.maxY - size.height - margin))
+    /// Frame of the frontmost System Settings window in AppKit coordinates.
+    static func settingsWindowFrame() -> NSRect? {
+        let owners: Set<String> = ["System Settings", "System Preferences", "系统设置", "系统偏好设置"]
+        let bundleIDs: Set<String> = ["com.apple.systempreferences"]
+        let settingsPIDs = Set(NSWorkspace.shared.runningApplications
+            .filter { bundleIDs.contains($0.bundleIdentifier ?? "") }
+            .map(\.processIdentifier))
+        guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]],
+              let primary = NSScreen.screens.first else { return nil }
+        // Front-to-back order: the first matching normal window is the one in use.
+        for w in info {
+            let pid = w[kCGWindowOwnerPID as String] as? pid_t ?? -1
+            let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+            guard settingsPIDs.contains(pid) || owners.contains(owner),
+                  w[kCGWindowLayer as String] as? Int == 0,
+                  let dict = w[kCGWindowBounds as String],
+                  let r = CGRect(dictionaryRepresentation: dict as! CFDictionary),
+                  r.width > 300, r.height > 200 else { continue }
+            // CG global coords have a top-left origin on the primary display.
+            return NSRect(x: r.minX, y: primary.frame.maxY - r.maxY, width: r.width, height: r.height)
+        }
+        return nil
     }
 
     /// Debug hook: rasterize the guide to PNG.
     func smokeDump(to path: String) {
-        guard let panel, let view = panel.contentView else { return }
-        view.displayIfNeeded()
-        let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+        guard let view = panel?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
         if let png = rep.representation(using: .png, properties: [:]) {
             try? png.write(to: URL(fileURLWithPath: path))
         }
     }
-
-    private func settingsWindowFrame() -> NSRect? {
-        let owners: Set<String> = ["System Settings", "System Preferences"]
-        guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]] else { return nil }
-        var best: NSRect?
-        var bestArea: CGFloat = 0
-        for w in info {
-            guard let owner = w[kCGWindowOwnerName as String] as? String, owners.contains(owner),
-                  w[kCGWindowLayer as String] as? Int == 0,
-                  let bounds = w[kCGWindowBounds as String] as? [String: CGFloat],
-                  let x = bounds["X"], let y = bounds["Y"],
-                  let width = bounds["Width"], let height = bounds["Height"] else { continue }
-            let r = NSRect(x: x, y: y, width: width, height: height)
-            let area = width * height
-            if area > bestArea { best = r; bestArea = area }
-        }
-        guard let topLeft = best,
-              let screen = NSScreen.screens.first(where: { $0.frame.intersects(topLeft) }) else { return best }
-        // Core Graphics uses top-left origin; flip to AppKit bottom-left.
-        return NSRect(x: topLeft.minX,
-                      y: screen.frame.maxY - topLeft.maxY,
-                      width: topLeft.width, height: topLeft.height)
-    }
 }
 
 final class PermissionGuideModel: ObservableObject {
-    @Published var trusted = false
-    @Published var bounce = false
+    @Published var kind: PermissionKind = .accessibility
+    @Published var granted = false
+    @Published var docked = false
+    @Published var nudge = false
 }
 
 private struct PermissionGuideView: View {
     @ObservedObject var model: PermissionGuideModel
-    let reveal: () -> Void
     let reopenSettings: () -> Void
+    let reveal: () -> Void
+    let reset: () -> Void
     let close: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Image(nsImage: NSApplication.shared.applicationIconImage)
-                    .resizable()
-                    .frame(width: 40, height: 40)
-                    .offset(y: model.bounce ? -3 : 0)
-                    .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true),
-                               value: model.bounce)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("授权辅助功能").font(.system(size: 14, weight: .semibold))
-                    Text("无需重启，授权后立即生效")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(action: close) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 15))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
+        HStack(alignment: .center, spacing: 14) {
+            VStack(spacing: 4) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
+                    .offset(y: model.nudge ? -4 : 2)
+                    .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: model.nudge)
+                    .opacity(model.granted ? 0 : 1)
+                AppDragSource()
+                    .frame(width: 64, height: 64)
+                Text(model.granted ? "已授权" : "拖我")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(model.granted ? Color.green : Color.secondary)
             }
+            .frame(width: 76)
 
-            VStack(alignment: .leading, spacing: 6) {
-                Label("点「在访达中显示」，让 SwitchMux 在访达中高亮", systemImage: "1.circle.fill")
-                Label("把 SwitchMux 图标拖入系统设置的辅助功能列表", systemImage: "2.circle.fill")
-                Label("打开列表项右侧的开关", systemImage: "3.circle.fill")
-            }
-            .font(.system(size: 11.5))
-            .foregroundStyle(.primary.opacity(0.9))
-            .labelStyle(GuideStepStyle())
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: 8) {
-                Button {
-                    reveal()
-                    reopenSettings()
-                } label: {
-                    Label("在访达中显示", systemImage: "folder")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .controlSize(.small)
-
-                Spacer()
-
-                HStack(spacing: 5) {
-                    if model.trusted {
-                        Image(systemName: "checkmark.circle.fill")
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    if model.granted {
+                        Label("SwitchMux 已获得\(model.kind.listName)权限", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
-                        Text("已授权").foregroundStyle(.green)
                     } else {
-                        ProgressView().controlSize(.mini)
-                        Text("等待授权…").foregroundStyle(.secondary)
+                        Text("允许 SwitchMux 使用\(model.kind.listName)")
+                    }
+                    Spacer()
+                    Button(action: close) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .background(Color.secondary.opacity(0.15), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .font(.system(size: 13, weight: .semibold))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    step(1, model.docked ? "把左边的图标拖进上方的「\(model.kind.listName)」列表" : "打开「系统设置」的「\(model.kind.listName)」，把左边的图标拖进列表")
+                    step(2, "打开 SwitchMux 右侧的开关")
+                    step(3, "列表里已有 SwitchMux 且开着却不生效？点下面的「重新添加」")
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.primary.opacity(0.85))
+
+                HStack(spacing: 10) {
+                    Button("打开系统设置", action: reopenSettings)
+                    if model.kind == .accessibility {
+                        Button("重新添加", action: reset)
+                            .help("清除 SwitchMux 旧的授权记录（例如更新后签名变化）并重新加入列表")
+                    } else {
+                        Button("在访达中显示", action: reveal)
+                    }
+                    Spacer()
+                    if !model.granted {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("等待授权").foregroundStyle(.secondary)
+                        }
+                        .font(.system(size: 10.5))
                     }
                 }
-                .font(.system(size: 11.5))
+                .controlSize(.small)
             }
         }
-        .padding(14)
-        .onAppear { model.bounce = true }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .onAppear { model.nudge = true }
+    }
+
+    private func step(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("\(n)")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 14, height: 14)
+                .background(Color.accentColor, in: Circle())
+            Text(text).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
-private struct GuideStepStyle: LabelStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(alignment: .top, spacing: 7) {
-            configuration.icon
-                .font(.system(size: 11.5))
-                .foregroundStyle(.tint)
-            configuration.title
-        }
+/// The SwitchMux icon as a real file drag source: dropping it on the
+/// System Settings privacy list adds the app, exactly like dragging it from
+/// Finder.
+private struct AppDragSource: NSViewRepresentable {
+    func makeNSView(context: Context) -> AppDragSourceView { AppDragSourceView() }
+    func updateNSView(_ nsView: AppDragSourceView, context: Context) {}
+}
+
+final class AppDragSourceView: NSView, NSDraggingSource {
+    private let imageView = NSImageView()
+
+    static var appURL: URL {
+        let url = Bundle.main.bundleURL
+        return url.pathExtension == "app" ? url : url.deletingLastPathComponent()
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        imageView.image = NSWorkspace.shared.icon(forFile: Self.appURL.path)
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.autoresizingMask = [.width, .height]
+        addSubview(imageView)
+        toolTip = "拖到系统设置的权限列表中"
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        imageView.frame = bounds
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseDragged(with event: NSEvent) {
+        let item = NSDraggingItem(pasteboardWriter: Self.appURL as NSURL)
+        item.setDraggingFrame(bounds, contents: imageView.image)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession,
+                         sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .outsideApplication ? [.copy, .link, .generic] : []
     }
 }

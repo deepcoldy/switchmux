@@ -65,18 +65,14 @@ enum PrefsSupport {
         return true
     }
 
-    /// One-click guidance: open the Accessibility pane, reveal the app in
-    /// Finder and present the floating drag guide. It dismisses as soon as the
-    /// grant is detected — no restart needed.
+    /// One-click guidance: open the Accessibility pane and dock the floating
+    /// guide (with a draggable app icon) to it. The guide dismisses itself as
+    /// soon as the grant is detected — no restart needed.
     static func guideToAccessibility() {
         PermissionWatcher.shared.refresh()
+        openAccessibilitySettings()
         if !PermissionWatcher.shared.trusted {
-            PermissionGuideController.shared.show()
-        }
-        revealAppInFinder()
-        // Give Finder a moment, then bring System Settings forward.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            openAccessibilitySettings()
+            PermissionGuideController.shared.show(.accessibility)
         }
     }
 
@@ -93,14 +89,11 @@ enum PrefsSupport {
         }
     }
 
-    /// Prime the TCC entry, reveal the app in Finder and open the Screen
-    /// Recording pane.
+    /// Prime the TCC entry, open the Screen Recording pane and dock the guide.
     static func guideToScreenRecording() {
         ScreenCapturePermission.request()
-        revealAppInFinder()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            openScreenRecordingSettings()
-        }
+        openScreenRecordingSettings()
+        PermissionGuideController.shared.show(.screenRecording)
     }
 
     static var accessibilityTrusted: Bool {

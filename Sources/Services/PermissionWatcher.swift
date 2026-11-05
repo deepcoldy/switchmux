@@ -44,6 +44,24 @@ final class PermissionWatcher: ObservableObject {
         AXIsProcessTrustedWithOptions(options)
     }
 
+    /// Removes SwitchMux's Accessibility record (only our own bundle ID) and
+    /// re-registers it. Fixes the common case where the list shows SwitchMux
+    /// switched on but the grant belongs to an older build with a different
+    /// signature, so it silently doesn't apply.
+    func resetAndReRegister() {
+        guard let bid = Bundle.main.bundleIdentifier else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "Accessibility", bid]
+        p.terminationHandler = { _ in
+            DispatchQueue.main.async {
+                self.systemPrompt()
+                PrefsSupport.openAccessibilitySettings()
+            }
+        }
+        do { try p.run() } catch { NSLog("SwitchMux: tccutil failed: \(error)") }
+    }
+
     /// Debug hook: synthesize a grant transition without touching TCC.
     func debugSimulateChange(_ value: Bool) {
         trusted = value
