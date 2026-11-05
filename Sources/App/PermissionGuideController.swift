@@ -164,17 +164,33 @@ final class PermissionGuideController {
         self.panel = panel
     }
 
-    /// Docks under the System Settings window (inside its bottom edge if
-    /// there's no room below), so the icon sits right below the list it must
-    /// be dropped into. Falls back to the top-right of the main screen.
+    /// System Settings' sidebar has a fixed width; the privacy list lives in
+    /// the content pane to its right (inset by the pane's margins).
+    static let settingsSidebarWidth: CGFloat = 252
+    static let settingsContentInsetRight: CGFloat = 20
+
+    /// Content-pane span (the list and its +/− bar) of a Settings window.
+    static func contentPane(of settings: NSRect) -> (minX: CGFloat, maxX: CGFloat) {
+        let sidebar = min(settingsSidebarWidth, settings.width * 0.45)
+        return (settings.minX + sidebar, settings.maxX - settingsContentInsetRight)
+    }
+
+    /// Docks right under the list in System Settings: left edge flush with
+    /// the list (so the icon and its arrow sit below the +/− bar it's dropped
+    /// next to), or inside the window's bottom edge if there's no room below.
+    /// Falls back to the top-right of the main screen.
     private func position(animated: Bool) {
         guard let panel else { return }
         var origin: NSPoint
         if let settings = Self.settingsWindowFrame(),
            let screen = NSScreen.screens.first(where: { $0.frame.intersects(settings) }) ?? NSScreen.main {
             let vf = screen.visibleFrame
-            let gap: CGFloat = 10
-            origin = NSPoint(x: settings.midX - size.width / 2, y: settings.minY - size.height - gap)
+            let pane = Self.contentPane(of: settings)
+            let gap: CGFloat = 8
+            // Prefer aligning with the list's left edge; if the pane is
+            // narrower than the panel, right-align with the pane instead.
+            let x = pane.maxX - pane.minX >= size.width ? pane.minX : pane.maxX - size.width
+            origin = NSPoint(x: x, y: settings.minY - size.height - gap)
             if origin.y < vf.minY + 8 {
                 origin.y = settings.minY + 16   // overlap the bottom of the window instead
             }
@@ -189,6 +205,13 @@ final class PermissionGuideController {
         let target = NSRect(origin: origin, size: size)
         guard panel.frame != target else { return }
         panel.setFrame(target, display: true, animate: animated && panel.isVisible)
+    }
+
+    /// Debug: current Settings window / content pane / panel frames.
+    func debugFrames() -> String {
+        let settings = Self.settingsWindowFrame()
+        let pane = settings.map { Self.contentPane(of: $0) }
+        return "settings=\(settings.map { "\($0)" } ?? "nil") pane=\(pane.map { "\($0.minX)…\($0.maxX)" } ?? "nil") panel=\(panel?.frame ?? .zero)"
     }
 
     /// Frame of the frontmost System Settings window in AppKit coordinates.
@@ -218,6 +241,7 @@ final class PermissionGuideController {
 
     /// Debug hook: rasterize the guide to PNG.
     func smokeDump(to path: String) {
+        try? debugFrames().write(toFile: path + ".txt", atomically: true, encoding: .utf8)
         guard let view = panel?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
         if let png = rep.representation(using: .png, properties: [:]) {
