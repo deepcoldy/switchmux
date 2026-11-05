@@ -379,6 +379,10 @@ final class WindowSwitcherController {
     /// Batch-capture via the bundled helper. It is a fresh process, so it
     /// sees Screen Recording grants made after SwitchMux launched.
     private func requestThumbnails() {
+        if DemoContent.isOn {
+            for card in cardViews { if let img = DemoContent.thumbnail(for: card.windowID) { card.setThumbnail(img) } }
+            return
+        }
         guard WindowCapture.isAvailable, let id = live?.id else { return }
         WindowCapture.capture(items) { [weak self] images in
             guard let self, self.live?.id == id else { return }

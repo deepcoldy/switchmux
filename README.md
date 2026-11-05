@@ -11,6 +11,25 @@
 
 按住 ⌥ Option，一条半透明快速栏即可启动 / 切换 / 隐藏应用；⌘Tab 在所有窗口的实时缩略图之间切换，⌥` 在同一应用的多个窗口之间切换。常驻菜单栏，原生 Swift / AppKit 实现，无需完整 Xcode，一条命令即可构建。
 
+<p align="center">
+  <a href="docs/media/switchmux-promo.mp4">
+    <img src="docs/media/promo-poster.png" width="800" alt="SwitchMux 宣传视频（点击播放）">
+  </a>
+  <br><sub>▶ 点击观看 40 秒介绍视频</sub>
+</p>
+
+## 下载安装
+
+1. 从 [Releases](https://github.com/deepcoldy/switchmux/releases/latest) 下载 `SwitchMux.dmg`（已签名并经 Apple 公证）。
+2. 打开 DMG，把 SwitchMux 拖到「应用程序」。
+3. 从「应用程序」打开 SwitchMux，欢迎向导会依次引导：安装位置 → 辅助功能授权（必需）→ 屏幕录制（可选，用于缩略图）→ 快捷键速览。
+
+直接在 DMG 里双击运行也没关系：SwitchMux 会提示并自动把自己移到「应用程序」后重新打开（放在磁盘映像里时授权无法保留，自动更新也无法替换）。之后的版本通过内置的自动更新安装。
+
+<p align="center">
+  <img src="docs/screenshots/dmg.png" width="560" alt="安装 DMG">
+</p>
+
 ## 截图
 
 **应用快速栏（App Bar）** —— 按住热键浮现，图标角标即触发键，松开或按数字切换：
@@ -25,7 +44,7 @@
   <img src="docs/screenshots/window-switcher.png" width="720" alt="窗口切换器">
 </p>
 
-**首次启动权限引导** 与 **系统设置旁的悬浮指引**（授权后立即生效，无需重启）：
+**首次启动向导** 与 **吸附在系统设置下方的授权浮窗**（把图标直接拖进列表，授权后立即生效，无需重启）：
 
 <p align="center">
   <img src="docs/screenshots/welcome.png" width="45%" alt="欢迎页">
@@ -77,7 +96,7 @@
 - 用量统计：按天记录，柱状图查看今天至一年内任意区间。
 - 外观：大小 70%–140%、不透明度、边框粗细、垂直 / 水平位置。
 - **配置自动同步**：设置存为单个 `config.json`，默认写入 iCloud Drive 目录自动多设备同步，本地保留镜像并热重载；与签名 / 二进制名无关，重新构建不丢配置。
-- 菜单栏图标与菜单、登录自启、欢迎页与实时权限引导。
+- 菜单栏图标与菜单、登录自启、分步欢迎向导与实时权限引导；从 DMG / 下载文件夹打开时自动移到「应用程序」。
 
 ## 构建
 
@@ -94,8 +113,12 @@ open build/SwitchMux.app
 
 首次运行需在 **系统设置 → 隐私与安全性** 授权：
 
-- **辅助功能**（必需）：全局热键与窗口操作。欢迎页可一键打开设置并在访达中高亮应用，直接拖入列表；授权后立即生效、无需重启。
+- **辅助功能**（必需）：全局热键与窗口操作。欢迎向导一键打开设置，并在系统设置窗口下方吸附一个浮窗，把其中的图标拖进列表即可；授权后立即生效、无需重启。
 - **屏幕录制**（可选）：仅用于窗口缩略图，不授权也可正常切换。
+
+临时签名的本地构建会被系统当作另一个应用，每次重新构建都要再授权一次。有 Developer ID 证书时运行一次 `scripts/sign-local.sh --save-password`，之后 `./build.sh` 会自动用证书签名，授权得以保留（见 [docs/RELEASING.md](docs/RELEASING.md)）。
+
+打包安装 DMG（与 CI 相同）：`scripts/make_dmg.sh build/SwitchMux.app build/SwitchMux.dmg`。
 
 ## 测试
 

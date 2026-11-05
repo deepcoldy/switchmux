@@ -44,6 +44,7 @@ enum WindowStore {
     /// z-order (which is focus order), then off-screen ones (other Spaces,
     /// minimized, hidden) by app recency.
     static func snapshot(_ q: Query) -> [WindowItem] {
+        if DemoContent.isOn { return DemoContent.windowItems(scope: q.scope) }
         let ownPID = ProcessInfo.processInfo.processIdentifier
         var apps = NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated }

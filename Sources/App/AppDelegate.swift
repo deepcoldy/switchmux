@@ -11,6 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Opened from the DMG / Downloads: offer to install first (relaunches).
+        // On first run the welcome window's install step does this instead,
+        // except from a disk image, which can never work and must move now.
+        if SettingsStore.shared.welcomeShown || MoveToApplications.isOnDiskImageOrTranslocated {
+            MoveToApplications.promptIfNeeded()
+        }
+
         // A crashed earlier instance may have left system ⌘Tab disabled;
         // make sure it comes back however we exit.
         if ProcessInfo.processInfo.environment["SWITCHMUX_NO_HOTKEYS"] == nil {
@@ -52,7 +59,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
         PermissionWatcher.shared.start()
-        if !PermissionWatcher.shared.trusted && hotkeysWanted {
+        // First run: the welcome window walks through the grant (and triggers
+        // the system alert from its own step), so nothing pops over it here.
+        if !PermissionWatcher.shared.trusted && hotkeysWanted && SettingsStore.shared.welcomeShown {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 // Registers SwitchMux in the Accessibility list (toggle off)
                 // and shows the system alert.

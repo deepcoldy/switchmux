@@ -160,8 +160,10 @@ jobs:
           set -euo pipefail
           KC="$(pwd)/.asc-work/signing.keychain-db"
           IDENTITY="$(security find-identity -v -p codesigning "$KC" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
-          hdiutil create -volname "$APP_NAME" -srcfolder "build/$APP_NAME.app" \
-            -ov -format UDZO "build/$APP_NAME.dmg"
+          # Drag-to-install layout: app + /Applications link, custom background
+          # and volume icon (dmgbuild + deps hash-pinned in scripts/dmg-requirements.txt,
+          # installed into a throwaway venv).
+          bash scripts/make_dmg.sh "build/$APP_NAME.app" "build/$APP_NAME.dmg"
           codesign --force --timestamp --keychain "$KC" --sign "$IDENTITY" "build/$APP_NAME.dmg"
 
       - name: Notarize and staple
