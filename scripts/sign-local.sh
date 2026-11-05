@@ -19,17 +19,43 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KEYCHAIN_SERVICE="SwitchMux signing p12"
 
+P12_DEFAULT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/开发者证书/Apple签名-8VP93PY3E9/developer-id-application.p12"
+
+# Does $2 open the .p12 at $1? (password passed via environment only)
+p12_password_ok() {
+  P12PASS="$2" openssl pkcs12 -in "$1" -passin env:P12PASS -nokeys -noout 2>/dev/null \
+    || P12PASS="$2" openssl pkcs12 -legacy -in "$1" -passin env:P12PASS -nokeys -noout 2>/dev/null
+}
+
 if [ "${1:-}" = "--save-password" ]; then
-  # -w as the last argument makes `security` prompt for the value itself, so
-  # the password never appears in argv or shell history.
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
-  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" \
-    -j "Import password of the Developer ID .p12 used by switchmux/scripts/sign-local.sh" -w
-  echo "Saved to the login keychain as \"$KEYCHAIN_SERVICE\"."
-  exit 0
+  P12="${SWITCHMUX_P12:-$P12_DEFAULT}"
+  head -c 1 "$P12" >/dev/null 2>&1 || { echo "Cannot read $P12" >&2; exit 1; }
+  prompt="请输入 Developer ID 证书（$(basename "$P12")）的导入密码。\n\n它会保存到本机登录钥匙串「${KEYCHAIN_SERVICE}」，之后 ./build.sh 会自动签名。"
+  for attempt in 1 2 3; do
+    if [ -t 0 ]; then
+      read -r -s -p "Password for $(basename "$P12"): " PW; echo
+    else
+      # No terminal (e.g. run by a tool): ask with a system dialog.
+      PW="$(osascript -e "display dialog \"$prompt\" default answer \"\" with hidden answer with title \"SwitchMux 本地签名\" buttons {\"取消\", \"保存\"} default button \"保存\" with icon caution" \
+                     -e 'text returned of result' 2>/dev/null)" || { echo "Cancelled." >&2; exit 1; }
+    fi
+    if [ -n "$PW" ] && p12_password_ok "$P12" "$PW"; then
+      # Fed through stdin, so it never appears in argv or shell history.
+      esc="$(printf '%s' "$PW" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      printf 'add-generic-password -U -a "%s" -s "%s" -T /usr/bin/security -w "%s"\n' "$USER" "$KEYCHAIN_SERVICE" "$esc" \
+        | security -i >/dev/null
+      unset PW esc
+      echo "Saved to the login keychain as \"$KEYCHAIN_SERVICE\"."
+      exit 0
+    fi
+    unset PW
+    echo "That password does not open $(basename "$P12")." >&2
+    prompt="密码不正确，请重新输入 $(basename "$P12") 的导入密码："
+  done
+  exit 1
 fi
 APP="${1:-$ROOT/build/SwitchMux.app}"
-P12="${2:-${SWITCHMUX_P12:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/开发者证书/Apple签名-8VP93PY3E9/developer-id-application.p12}}"
+P12="${2:-${SWITCHMUX_P12:-$P12_DEFAULT}}"
 TEAM_ID="8VP93PY3E9"
 
 [ -d "$APP" ] || { echo "No app at $APP (run ./build.sh first)" >&2; exit 1; }
