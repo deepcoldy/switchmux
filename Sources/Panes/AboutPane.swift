@@ -13,7 +13,7 @@ struct AboutPane: View {
             Text("版本 \(AppInfo.shortVersion)（\(AppInfo.build)）")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("按住 Option（可在「高级」中修改）并按下数字键，快速切换、启动或隐藏应用。")
+            Text("按住 ⌥ 并按下应用对应的按键，快速打开、切换或隐藏应用；⌘Tab 浏览所有窗口，⌥` 在同一应用的窗口间切换。")
                 .multilineTextAlignment(.center)
                 .font(.caption)
                 .foregroundStyle(.secondary)

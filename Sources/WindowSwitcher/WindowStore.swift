@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-/// One switchable window across applications.
+/// One switchable window.
 struct WindowItem {
     let windowID: CGWindowID
     let pid: pid_t
@@ -13,166 +13,150 @@ struct WindowItem {
     let isOnScreen: Bool
     let app: NSRunningApplication
     let icon: NSImage
+    /// Live AX element (nil when the app doesn't expose AX).
+    let element: AXUIElement?
 }
 
 enum WindowStore {
-    /// Snapshot windows for the requested scope. Accessibility is the
-    /// authority for window identity: only AXStandardWindow windows (or windows
-    /// with a close button) are kept, which excludes overlay/accessory windows
-    /// that also appear in the Core Graphics window list.
-    static func snapshot(scope: WindowScope, includeMinimized: Bool, includeHidden: Bool) -> [WindowItem] {
-        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let running = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+    struct Query {
+        var scope: WindowScope
+        var includeMinimized: Bool
+        var includeHidden: Bool
+        /// Captured on the main thread before going to the background.
+        var frontPID: pid_t?
+        var mru: [String]
+    }
 
-        // CG metadata by window number.
+    static func query(scope: WindowScope) -> Query {
+        let s = SettingsStore.shared
+        return Query(scope: scope,
+                     includeMinimized: s.includeMinimizedWindows,
+                     includeHidden: s.includeHiddenAppWindows,
+                     frontPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                     mru: s.mruBundleIDs)
+    }
+
+    /// Enumerates windows. Safe to call off the main thread (and it should be:
+    /// AX calls block on busy apps; each app gets a 0.25 s messaging timeout
+    /// and apps are queried in parallel so one hung app can't stall the rest).
+    ///
+    /// Order = most recently used first: on-screen windows in WindowServer
+    /// z-order (which is focus order), then off-screen ones (other Spaces,
+    /// minimized, hidden) by app recency.
+    static func snapshot(_ q: Query) -> [WindowItem] {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        var apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated }
+        if q.scope == .currentApp {
+            apps = apps.filter { $0.processIdentifier == q.frontPID }
+        }
+
+        // CG metadata by window number, plus the on-screen z-order.
         var cgMeta: [CGWindowID: [String: Any]] = [:]
+        var pidsWithWindows = Set<pid_t>()
         if let raw = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] {
             for info in raw {
-                guard let num = info[kCGWindowNumber as String] as? Int else { continue }
+                guard let num = info[kCGWindowNumber as String] as? Int,
+                      (info[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
                 cgMeta[CGWindowID(num)] = info
+                if let pid = info[kCGWindowOwnerPID as String] as? pid_t { pidsWithWindows.insert(pid) }
+            }
+        }
+        var zOrder: [CGWindowID: Int] = [:]
+        if let onScreen = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                     kCGNullWindowID) as? [[String: Any]] {
+            for (i, info) in onScreen.enumerated() {
+                if let num = info[kCGWindowNumber as String] as? Int { zOrder[CGWindowID(num)] = i }
             }
         }
 
-        var result: [WindowItem] = []
+        // Apps without any normal-layer window can't contribute; skip their AX round trip.
+        apps = apps.filter { pidsWithWindows.contains($0.processIdentifier) }
 
-        for app in running {
-            let pid = app.processIdentifier
-            var axWindows: [AXUIElement] = []
-            let axApp = AXUIElementCreateApplication(pid)
-            var winsRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success,
-               let wins = winsRef as? [AXUIElement] {
-                axWindows = wins.filter(isStandardWindow)
+        var perApp = [[WindowItem]](repeating: [], count: apps.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: apps.count) { i in
+            let items = windows(of: apps[i], q: q, cgMeta: cgMeta)
+            lock.lock(); perApp[i] = items; lock.unlock()
+        }
+        let all = perApp.flatMap { $0 }
+
+        func appRank(_ item: WindowItem) -> Int {
+            if item.pid == q.frontPID { return -1 }
+            if let bid = item.bundleID, let i = q.mru.firstIndex(of: bid) { return i }
+            return Int.max / 2
+        }
+        return all.enumerated().sorted { a, b in
+            let za = zOrder[a.element.windowID], zb = zOrder[b.element.windowID]
+            switch (za, zb) {
+            case let (x?, y?): return x < y
+            case (.some, nil): return true
+            case (nil, .some): return false
+            default:
+                let ra = appRank(a.element), rb = appRank(b.element)
+                if ra != rb { return ra < rb }
+                return a.offset < b.offset
             }
+        }.map(\.element)
+    }
 
-            if axWindows.isEmpty {
-                // AX unavailable: fall back to the CG list for this app.
-                result.append(contentsOf: fallbackWindows(app: app, cgMeta: cgMeta,
-                                                          scope: scope, frontPID: frontPID,
-                                                          includeMinimized: includeMinimized,
-                                                          includeHidden: includeHidden))
-                continue
-            }
-
-            for window in axWindows {
-                var cgid = CGWindowID(0)
-                guard axWindowID(window, &cgid) else { continue }
-                let meta = cgMeta[cgid]
-                let onScreen = (meta?[kCGWindowIsOnscreen as String] as? Bool) ?? false
-                var minimized = axBool(window, kAXMinimizedAttribute as CFString) ?? false
-                // AX sometimes lags; cross-check CG (off-screen + no AX flag).
-                if minimized == false && onScreen == false && app.isHidden == false {
-                    // Could be other-Space or minimized; trust AX for standard windows.
-                }
-
-                if app.isHidden {
-                    guard includeHidden else { continue }
-                }
-                if minimized {
-                    guard includeMinimized else { continue }
-                }
-                if !onScreen && !minimized && !app.isHidden && scope != .allWindows {
-                    continue // window on another Space
-                }
-                if scope == .currentApp, pid != frontPID { continue }
-                if scope == .currentSpace, onScreen == false { continue }
-
-                let title = (axString(window, kAXTitleAttribute as CFString))
-                    .flatMap { $0.isEmpty ? nil : $0 } ?? (app.localizedName ?? "")
-                let frame = cgFrame(meta) ?? axFrame(window)
-                result.append(WindowItem(
-                    windowID: cgid, pid: pid,
-                    appName: app.localizedName ?? "",
-                    bundleID: app.bundleIdentifier,
-                    title: title,
-                    frame: frame,
-                    isMinimized: minimized,
-                    isOnScreen: onScreen,
-                    app: app,
-                    icon: app.icon ?? NSImage()
-                ))
-            }
+    private static func windows(of app: NSRunningApplication, q: Query,
+                                cgMeta: [CGWindowID: [String: Any]]) -> [WindowItem] {
+        if app.isHidden && !q.includeHidden { return [] }
+        let pid = app.processIdentifier
+        let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.25)
+        var winsRef: CFTypeRef?
+        let axOK = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &winsRef) == .success
+        let axWindows = (winsRef as? [AXUIElement]) ?? []
+        if !axOK {
+            return fallbackWindows(app: app, q: q, cgMeta: cgMeta)
         }
 
-        return ordered(result)
-    }
+        var out: [WindowItem] = []
+        for window in axWindows where AX.isStandardWindow(window) {
+            let wid = PrivateAPI.windowID(of: window)
+            guard wid != 0 else { continue }
+            let meta = cgMeta[wid]
+            let onScreen = (meta?[kCGWindowIsOnscreen as String] as? Bool) ?? false
+            let minimized = AX.bool(window, kAXMinimizedAttribute)
+            if minimized && !q.includeMinimized { continue }
+            // Off-screen, not minimized, app not hidden → on another Space.
+            let otherSpace = !onScreen && !minimized && !app.isHidden
+            // A hidden app's windows are off-screen on every Space, so their
+            // Space can't be told; keep them out of the current-Space scope.
+            if q.scope == .currentSpace && (otherSpace || minimized || app.isHidden) { continue }
 
-    // MARK: AX helpers
-    private static func isStandardWindow(_ window: AXUIElement) -> Bool {
-        var roleRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXRoleAttribute as CFString, &roleRef) == .success,
-              (roleRef as? String) == "AXWindow" else { return false }
-        var subRef: CFTypeRef?
-        let sub = AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subRef) == .success
-            ? (subRef as? String) : nil
-        if sub == "AXStandardWindow" { return true }
-        // Some standard windows omit the subrole but still have a close button.
-        var closeRef: CFTypeRef?
-        return AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &closeRef) == .success
-    }
-
-    private static let axGetWindow: @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> Int32 = {
-        let handle = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_LAZY)
-        let sym = dlsym(handle, "_AXUIElementGetWindow")
-        return unsafeBitCast(sym, to: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> Int32).self)
-    }()
-
-    private static func axWindowID(_ window: AXUIElement, _ id: inout CGWindowID) -> Bool {
-        axGetWindow(window, &id) == 0 && id != 0
-    }
-
-    private static func axString(_ element: AXUIElement, _ attr: CFString) -> String? {
-        var v: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, attr, &v) == .success ? v as? String : nil
-    }
-
-    private static func axBool(_ element: AXUIElement, _ attr: CFString) -> Bool? {
-        var v: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, attr, &v) == .success ? (v as? Bool) : nil
-    }
-
-    private static func axFrame(_ window: AXUIElement) -> CGRect {
-        var posRef: CFTypeRef?
-        var sizeRef: CFTypeRef?
-        var rect = CGRect.zero
-        if AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
-           AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
-           let posValue = posRef, let sizeValue = sizeRef {
-            var point = CGPoint.zero
-            var size = CGSize.zero
-            if AXValueGetType(posValue as! AXValue) == .cgPoint,
-               AXValueGetType(sizeValue as! AXValue) == .cgSize,
-               AXValueGetValue(posValue as! AXValue, .cgPoint, &point),
-               AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) {
-                rect = CGRect(origin: point, size: size)
-            }
+            let title = AX.string(window, kAXTitleAttribute).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (app.localizedName ?? "")
+            out.append(WindowItem(
+                windowID: wid, pid: pid,
+                appName: app.localizedName ?? "",
+                bundleID: app.bundleIdentifier,
+                title: title,
+                frame: cgFrame(meta) ?? axFrame(window),
+                isMinimized: minimized,
+                isOnScreen: onScreen,
+                app: app,
+                icon: app.icon ?? NSImage(),
+                element: window))
         }
-        return rect
+        return out
     }
 
-    private static func cgFrame(_ meta: [String: Any]?) -> CGRect? {
-        guard let b = meta?[kCGWindowBounds as String] as? [String: CGFloat],
-              let x = b["X"], let y = b["Y"], let w = b["Width"], let h = b["Height"] else { return nil }
-        return CGRect(x: x, y: y, width: w, height: h)
-    }
-
-    // MARK: CG fallback (AX unavailable)
-    private static func fallbackWindows(app: NSRunningApplication, cgMeta: [CGWindowID: [String: Any]],
-                                        scope: WindowScope, frontPID: pid_t?,
-                                        includeMinimized: Bool, includeHidden: Bool) -> [WindowItem] {
+    // MARK: CG fallback (app doesn't answer AX)
+    private static func fallbackWindows(app: NSRunningApplication, q: Query,
+                                        cgMeta: [CGWindowID: [String: Any]]) -> [WindowItem] {
         var out: [WindowItem] = []
         for (id, info) in cgMeta {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == app.processIdentifier else { continue }
-            let layer = info[kCGWindowLayer as String] as? Int ?? 0
-            guard layer == 0 else { continue }
-            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
-            guard alpha > 0.05 else { continue }
-            guard let frame = cgFrame(info), frame.width > 120, frame.height > 80 else { continue }
+            guard (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
+                  let frame = cgFrame(info), frame.width > 120, frame.height > 80 else { continue }
             let onScreen = (info[kCGWindowIsOnscreen as String] as? Bool) ?? false
-            if scope == .currentApp, pid != frontPID { continue }
-            if scope == .currentSpace, onScreen == false { continue }
-            if !onScreen, scope != .allWindows { continue }
+            if q.scope == .currentSpace && !onScreen { continue }
+            // Without AX we can't tell minimized from other-Space; only keep visible ones
+            // unless the user wants everything.
+            if !onScreen && q.scope != .allWindows { continue }
             let title = (info[kCGWindowName as String] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (app.localizedName ?? "")
             out.append(WindowItem(
@@ -180,32 +164,28 @@ enum WindowStore {
                 appName: app.localizedName ?? "", bundleID: app.bundleIdentifier,
                 title: title, frame: frame,
                 isMinimized: false, isOnScreen: onScreen,
-                app: app, icon: app.icon ?? NSImage()))
+                app: app, icon: app.icon ?? NSImage(), element: nil))
         }
         return out
     }
 
-    // MARK: Ordering (frontmost app, then MRU, then launch date)
-    private static func ordered(_ items: [WindowItem]) -> [WindowItem] {
-        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let mru = SettingsStore.shared.mruBundleIDs
-        func rank(_ item: WindowItem) -> Int {
-            if item.pid == frontPID { return -2 }
-            if let bid = item.bundleID, let i = mru.firstIndex(of: bid) { return i }
-            return 1_000_000
-        }
-        // Items arrive grouped by app in AX order; remember first index per app.
-        var appOrder: [pid_t: Int] = [:]
-        for (i, item) in items.enumerated() where appOrder[item.pid] == nil {
-            appOrder[item.pid] = i
-        }
-        return items.enumerated().sorted { lhs, rhs in
-            let ra = rank(lhs.element); let rb = rank(rhs.element)
-            if ra != rb { return ra < rb }
-            let ao = appOrder[lhs.element.pid] ?? 0
-            let bo = appOrder[rhs.element.pid] ?? 0
-            if ao != bo { return ao < bo }
-            return lhs.offset < rhs.offset   // stable within-app (AX z-order)
-        }.map(\.element)
+    // MARK: Geometry
+    private static func axFrame(_ window: AXUIElement) -> CGRect {
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posRef, let sizeRef,
+              CFGetTypeID(posRef) == AXValueGetTypeID(), CFGetTypeID(sizeRef) == AXValueGetTypeID() else { return .zero }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(posRef as! AXValue, .cgPoint, &point)
+        AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+        return CGRect(origin: point, size: size)
+    }
+
+    private static func cgFrame(_ meta: [String: Any]?) -> CGRect? {
+        guard let dict = meta?[kCGWindowBounds as String] else { return nil }
+        return CGRect(dictionaryRepresentation: dict as! CFDictionary)
     }
 }

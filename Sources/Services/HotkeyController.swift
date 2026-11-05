@@ -1,245 +1,307 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
+import Combine
 
-/// State machine for BOTH activation contexts:
-/// - App Bar hotkey (default ⌥ Option): hold → icon bar, digits to switch.
-/// - Window switcher hotkey (default ⌘ Command): press Tab while holding the
-///   modifier → thumbnail grid; Tab/arrows/digits navigate, release activates.
-/// Double-pressing the App Bar hotkey toggles enablement temporarily.
+/// Coordinates every global shortcut:
+/// - App Bar: hold the activation modifier (default ⌥) → icon bar; bound keys switch apps.
+/// - Window switcher: ⌘Tab (all windows) and ⌥` (current app's windows),
+///   registered as Carbon hotkeys; releasing the modifier activates the selection.
+///
+/// All state lives on the main thread. The event tap (own thread) only routes.
 final class HotkeyController {
     static let shared = HotkeyController()
 
-    private enum Context { case bar, windowSwitcher }
+    private enum Trigger: Int {
+        case allForward, allBackward, appForward, appBackward
+    }
 
     private let tap = HotkeyEventTap()
-    private var displayWorkItem: DispatchWorkItem?
-    private var lastReleaseAt: Date = .distantPast
-    private var lastPressAt: Date = .distantPast
+    private var cancellables = Set<AnyCancellable>()
+    private var configSignature = ""
+
+    // App Bar hold state
+    private var barHeld = false
+    private var barPressAt: CFAbsoluteTime = 0
+    private var lastCleanTapAt: CFAbsoluteTime = 0
     private var toggleSuppressed = false
-    private var active: Context?
+    private var displayWork: DispatchWorkItem?
 
-    // Window-switcher quick-chord arbitration: a short Tab press is handed
-    // back to the system (native ⌘Tab), holding it past the threshold shows
-    // our thumbnail grid. Kept short: a typical fast tap is 50–130 ms.
-    private let triggerKeyCode: CGKeyCode = 48 // Tab
-    private let holdThreshold: TimeInterval = 0.15
-    private var triggerWorkItem: DispatchWorkItem?
-    private var triggerArmed = false
-    private var triggerFlags: NSEvent.ModifierFlags = []
-    private var nativePassthrough = false
+    // Window switcher session
+    private var sessionMask: NSEvent.ModifierFlags?
 
-    private let relevantMask: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
-    private let doublePressWindow: TimeInterval = 0.35
+    /// Fallback for missed flagsChanged events (secure input, tap hiccups):
+    /// while anything is held we poll the real modifier state.
+    private var pollTimer: Timer?
+
+    private let doublePressWindow: CFTimeInterval = 0.35
+    private let cleanTapMaxDuration: CFTimeInterval = 0.3
+
+    private var hotkeysDisabledByEnv: Bool {
+        ProcessInfo.processInfo.environment["SWITCHMUX_NO_HOTKEYS"] != nil
+    }
 
     private init() {}
 
+    // MARK: Setup
     func start() {
-        tap.onFlagsChanged = { [weak self] flags in self?.handleFlags(flags) }
-        tap.onKeyDown = { [weak self] event in self?.handleKey(event) ?? false }
-        tap.onKeyUp = { [weak self] event in self?.handleKeyUp(event) ?? false }
-        ensureTap()
-    }
+        tap.onFlagsChanged = { [weak self] flags, time in self?.handleFlags(flags, at: time) }
+        tap.onBarKey = { [weak self] code in self?.handleBarKey(code) }
+        tap.onSessionKey = { code, flags in WindowSwitcherController.shared.handleKey(code, flags: flags) }
+        tap.onFallbackTrigger = { [weak self] raw in
+            if let t = Trigger(rawValue: raw) { self?.fire(t) }
+        }
+        WindowSwitcherController.shared.onSessionEnded = { [weak self] in self?.sessionEndedByUI() }
 
-    func ensureTap() {
-        guard !tap.isActive else { return }
-        guard AXIsProcessTrusted() else { return }
-        tap.start()
+        SettingsStore.shared.objectWillChange
+            .debounce(for: .milliseconds(30), scheduler: RunLoop.main)
+            .sink { [weak self] in self?.reconfigureIfNeeded() }
+            .store(in: &cancellables)
+        AppsMonitor.shared.changePublisher
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.updateBarRouting() }
+            .store(in: &cancellables)
+
+        rebuildTap()
     }
 
     func rebuildTap() {
         tap.stop()
-        ensureTap()
+        if !hotkeysDisabledByEnv && AXIsProcessTrusted() { tap.start() }
+        configSignature = ""
+        reconfigureIfNeeded()
     }
 
     var tapActive: Bool { tap.isActive }
 
+    /// Restores system ⌘Tab; called on quit.
+    func shutdown() {
+        CarbonHotkeys.shared.unregisterAll()
+        tap.stop()
+        NativeCommandTab.shutdown()
+    }
+
     private var barMask: NSEvent.ModifierFlags {
-        let mask = SettingsStore.shared.activateModifiers.intersection(relevantMask)
-        return mask.isEmpty ? .option : mask
-    }
-    private var windowMask: NSEvent.ModifierFlags {
-        SettingsStore.shared.windowSwitcherModifiers.intersection(relevantMask)
+        let m = SettingsStore.shared.activateModifiers.intersection(KeyChord.relevant)
+        return m.isEmpty ? .option : m
     }
 
-    // MARK: Flags
-    private func handleFlags(_ flags: NSEvent.ModifierFlags) {
-        let relevant = flags.intersection(relevantMask)
+    /// Re-registers hotkeys only when a setting that affects them changed
+    /// (usage counters etc. also publish changes and must not churn this).
+    private func reconfigureIfNeeded() {
+        let s = SettingsStore.shared
+        let signature = [
+            "\(tap.isActive)", "\(s.windowSwitcherEnabled)", s.windowSwitcherModifier.rawValue,
+            "\(s.appWindowSwitcherEnabled)", s.appWindowSwitcherModifier.rawValue, "\(KeyCodes.keyAboveTab)",
+        ].joined(separator: "|")
+        if signature != configSignature {
+            configSignature = signature
+            registerSwitcherHotkeys()
+        }
+        updateBarRouting()
+    }
 
-        if active == nil {
-            if SettingsStore.shared.windowSwitcherEnabled && !windowMask.isEmpty && relevant == windowMask
-                && windowMask != barMask {
-                begin(.windowSwitcher)
-                return
+    private var carbonChords = Set<KeyChord>()
+    private var fallbackTriggers: [KeyChord: Int] = [:]
+
+    private func registerSwitcherHotkeys() {
+        let s = SettingsStore.shared
+        CarbonHotkeys.shared.unregisterAll()
+        carbonChords = []
+        fallbackTriggers = [:]
+
+        func bind(_ keyCode: UInt16, _ mods: NSEvent.ModifierFlags, _ trigger: Trigger) {
+            let chord = KeyChord(keyCode, mods)
+            if CarbonHotkeys.shared.register(keyCode: keyCode, modifiers: mods, action: { [weak self] in
+                self?.fire(trigger)
+            }) {
+                carbonChords.insert(chord)
+            } else {
+                fallbackTriggers[chord] = trigger.rawValue
             }
-            if relevant == barMask {
-                beginBar()
-                return
+        }
+
+        // Everything requires the tap (Accessibility): without it we could not
+        // see the modifier release nor raise windows, so leave the system alone.
+        let active = tap.isActive
+        if active && s.windowSwitcherEnabled {
+            let m = s.windowSwitcherModifier.flags
+            bind(KeyCodes.tab, m, .allForward)
+            bind(KeyCodes.tab, m.union(.shift), .allBackward)
+        }
+        if active && s.appWindowSwitcherEnabled {
+            let m = s.appWindowSwitcherModifier.flags
+            // Only the physical key above Tab: on ISO keyboards that's § (10)
+            // and 50 is the extra key next to left Shift, which must stay typable.
+            for code in [KeyCodes.keyAboveTab] {
+                bind(code, m, .appForward)
+                bind(code, m.union(.shift), .appBackward)
             }
-        } else {
-            // While held, extra modifiers are allowed as long as the context
-            // mask stays down.
-            if active == .windowSwitcher, relevant.contains(windowMask) { return }
-            if active == .bar, relevant.contains(barMask) { return }
-            release()
+        }
+        // ⌘Tab is consumed by the Dock before any app hotkey, so owning it
+        // means turning the native one off (restored on quit / when disabled).
+        let ownsCommandTab = active && s.windowSwitcherEnabled && s.windowSwitcherModifier == .command
+        // Dev / smoke runs (SWITCHMUX_NO_HOTKEYS) never touch the global state.
+        if !hotkeysDisabledByEnv { NativeCommandTab.setNativeEnabled(!ownsCommandTab) }
+    }
+
+    private func updateBarRouting() {
+        if !hotkeysDisabledByEnv { NativeCommandTab.reassert() }
+        let s = SettingsStore.shared
+        let mask = barMask
+        let reserved = carbonChords.union(fallbackTriggers.keys)
+        let codes = Set(s.apps.compactMap(\.triggerKeyCode))
+            .filter { !reserved.contains(KeyChord($0, mask)) }
+        var keysEnabled = s.enabled
+        if let bid = AppsMonitor.shared.frontmost?.bundleIdentifier,
+           let entry = s.silentEntry(for: bid), entry.disableShortcuts {
+            keysEnabled = false
+        }
+        let carbon = carbonChords, fallback = fallbackTriggers
+        tap.updateRouting { r in
+            r.barMask = mask
+            r.barKeyCodes = codes
+            r.barKeysEnabled = keysEnabled
+            r.carbonChords = carbon
+            r.fallbackTriggers = fallback
         }
     }
 
-    private func begin(_ context: Context) {
-        active = context
-        switch context {
-        case .windowSwitcher:
-            // Chord model: merely holding the modifier does nothing
-            // (so ⌘C, ⌘V, … keep working). The overlay appears only when the
-            // trigger key (Tab) is pressed while the modifier is held.
-            break
-        case .bar:
-            break
+    // MARK: Modifier state
+    /// `time` is when the change physically happened (tap thread clock), so
+    /// clean-tap detection isn't fooled by main-thread lag.
+    private func handleFlags(_ flags: NSEvent.ModifierFlags, at time: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()) {
+        let relevant = flags.intersection(KeyChord.relevant)
+
+        if let mask = sessionMask, !relevant.contains(mask) {
+            endSession(activate: true)
+        }
+        if barHeld {
+            if !relevant.contains(barMask) { barReleased(at: time) }
+        } else if relevant == barMask && sessionMask == nil {
+            barPressed(at: time)
+        }
+        updatePolling()
+    }
+
+    private func updatePolling() {
+        let needed = barHeld || sessionMask != nil
+        if needed, pollTimer == nil {
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+                let raw = CGEventSource.flagsState(.combinedSessionState).rawValue
+                self?.handleFlags(NSEvent.ModifierFlags(rawValue: UInt(raw)))
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            pollTimer = timer
+        } else if !needed, let timer = pollTimer {
+            timer.invalidate()
+            pollTimer = nil
         }
     }
 
-    private func beginBar() {
-        active = .bar
-        guard !toggleSuppressed else { return }
+    // MARK: App Bar
+    private func barPressed(at now: CFAbsoluteTime) {
+        let s = SettingsStore.shared
+        barHeld = true
+        barPressAt = now
 
-        let now = Date()
-        if SettingsStore.shared.doublePressToggle,
-           now.timeIntervalSince(lastReleaseAt) < doublePressWindow,
-           now.timeIntervalSince(lastPressAt) > 0.05 {
-            SettingsStore.shared.enabled.toggle()
+        // Double-tap of the bare modifier toggles SwitchMux. Only clean taps
+        // count (no key pressed in between), so ⌥1 … ⌥2 in quick succession
+        // no longer pauses the app by accident.
+        if s.doublePressToggle && now - lastCleanTapAt < doublePressWindow {
+            lastCleanTapAt = 0
             toggleSuppressed = true
+            s.enabled.toggle()
             announceEnabledState()
             return
         }
-        lastPressAt = now
-
-        guard SettingsStore.shared.enabled else { return }
+        guard s.enabled else { return }
         if let bid = AppsMonitor.shared.frontmost?.bundleIdentifier,
-           let entry = SettingsStore.shared.silentEntry(for: bid),
-           entry.hideBar {
+           let entry = s.silentEntry(for: bid), entry.hideBar {
             return
         }
+        let delay = s.displayDelay
+        guard delay >= 0 else { return } // "never": blind shortcuts only
 
-        let delay = SettingsStore.shared.displayDelay
-        if delay < 0 { return } // "Never display" — blind shortcuts only.
-
-        let work = DispatchWorkItem { AppBarController.shared.show() }
-        displayWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay), execute: work)
-    }
-
-    private func release() {
-        displayWorkItem?.cancel()
-        displayWorkItem = nil
-        cancelTriggerArm()
-        let wasPassthrough = nativePassthrough
-        nativePassthrough = false
-        toggleSuppressed = false
-        lastReleaseAt = Date()
-        switch active {
-        case .bar:
-            if AppBarController.shared.isVisible {
-                AppBarController.shared.hide(activateHovered: SettingsStore.shared.switchByReleasing)
-            }
-        case .windowSwitcher:
-            // Only finish our overlay if it actually appeared. A passthrough
-            // chord (quick release) must do nothing here — the native switcher
-            // handles activation on key-up itself.
-            if WindowSwitcherController.shared.isVisible && !wasPassthrough {
-                WindowSwitcherController.shared.finish(activate: true)
-            }
-        case .none:
-            break
-        }
-        active = nil
-    }
-
-    // MARK: Window-switcher trigger arbitration
-
-    private func armTrigger(_ event: NSEvent) {
-        guard !triggerArmed else { return }
-        triggerArmed = true
-        nativePassthrough = false
-        triggerFlags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let forward = !event.modifierFlags.contains(.shift)
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.triggerArmed else { return }
-            self.triggerArmed = false
-            self.triggerWorkItem = nil
-            WindowSwitcherController.shared.present(forward: forward)
+            guard let self, self.barHeld, self.sessionMask == nil else { return }
+            AppBarController.shared.show()
         }
-        triggerWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + holdThreshold, execute: work)
+        displayWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func cancelTriggerArm() {
-        triggerWorkItem?.cancel()
-        triggerWorkItem = nil
-        triggerArmed = false
+    private func barReleased(at now: CFAbsoluteTime) {
+        barHeld = false
+        displayWork?.cancel()
+        displayWork = nil
+        let clean = !toggleSuppressed
+            && tap.lastKeyDown < barPressAt
+            && now - barPressAt < cleanTapMaxDuration
+        lastCleanTapAt = clean ? now : 0
+        toggleSuppressed = false
+        if AppBarController.shared.isVisible {
+            AppBarController.shared.hide(activateHovered: SettingsStore.shared.switchByReleasing)
+        }
     }
 
-    private func handleKeyUp(_ event: NSEvent) -> Bool {
-        guard active == .windowSwitcher, event.keyCode == triggerKeyCode else { return false }
-        // Quick release while still in the arming window → forward the whole
-        // chord to the native switcher, then tear our context down quietly.
-        if triggerArmed {
-            cancelTriggerArm()
-            nativePassthrough = true
-            // Post from OUTSIDE this tap callback (next runloop turn): events
-            // posted synchronously inside a tap callback get mis-ordered against
-            // the swallowed physical event and the Dock never sees the chord.
-            DispatchQueue.main.async { [weak self] in self?.forwardTriggerToSystem() }
-            DispatchQueue.main.async { [weak self] in self?.release() }
-            return true
-        }
-        return false
+    private func handleBarKey(_ keyCode: UInt16) {
+        AppBarController.shared.triggerKey(keyCode)
     }
 
-    /// Re-posts the swallowed Tab chord to the native switcher: key-down now,
-    /// key-up ~30 ms later like a real physical tap.
-    private func forwardTriggerToSystem() {
-        let source = CGEventSource(stateID: .hidSystemState)
-        let cgFlags = CGEventFlags(rawValue: UInt64(triggerFlags.rawValue))
-        func post(_ down: Bool) {
-            guard let cg = CGEvent(keyboardEventSource: source, virtualKey: triggerKeyCode, keyDown: down) else { return }
-            cg.setIntegerValueField(.eventSourceUserData, value: HotkeyEventTap.syntheticUserData)
-            cg.flags = cgFlags
-            cg.post(tap: .cghidEventTap)
+    // MARK: Window switcher
+    private func fire(_ trigger: Trigger) {
+        let s = SettingsStore.shared
+        switch trigger {
+        case .allForward, .allBackward:
+            beginOrStep(scope: s.windowScope, mask: s.windowSwitcherModifier.flags,
+                        forward: trigger == .allForward)
+        case .appForward, .appBackward:
+            beginOrStep(scope: .currentApp, mask: s.appWindowSwitcherModifier.flags,
+                        forward: trigger == .appForward)
         }
-        post(true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { post(false) }
     }
 
-    private func handleKey(_ event: NSEvent) -> Bool {
-        switch active {
-        case .windowSwitcher:
-            // Overlay not up yet: the trigger key starts the hold-or-forward
-            // arbitration and is swallowed either way (quick release forwards a
-            // synthetic copy instead). Every other key passes through untouched
-            // (⌘C/⌘V/⌘` and the native switcher all keep working).
-            if !WindowSwitcherController.shared.isVisible {
-                if event.keyCode == triggerKeyCode {
-                    armTrigger(event)
-                    return true
-                }
-                return false
-            }
-            return WindowSwitcherController.shared.handleKey(event)
-        case .bar:
-            return AppBarController.shared.handleKeyDown(event)
-        case .none:
-            return false
+    private func beginOrStep(scope: WindowScope, mask: NSEvent.ModifierFlags, forward: Bool) {
+        if sessionMask != nil {
+            WindowSwitcherController.shared.step(forward: forward)
+            return
         }
+        // The switcher takes over from a pending / visible App Bar
+        // (e.g. ⌥ held for the bar, then ` pressed).
+        displayWork?.cancel()
+        displayWork = nil
+        if AppBarController.shared.isVisible { AppBarController.shared.hide(activateHovered: false) }
+
+        sessionMask = mask
+        tap.updateRouting { $0.sessionActive = true }
+        WindowSwitcherController.shared.beginSession(scope: scope, forward: forward)
+        updatePolling()
+
+        // The hotkey may have been delivered late (main thread was busy) after
+        // the modifier was already let go: settle immediately.
+        let raw = CGEventSource.flagsState(.combinedSessionState).rawValue
+        handleFlags(NSEvent.ModifierFlags(rawValue: UInt(raw)))
+    }
+
+    private func endSession(activate: Bool) {
+        guard sessionMask != nil else { return }
+        sessionMask = nil
+        tap.updateRouting { $0.sessionActive = false }
+        WindowSwitcherController.shared.endSession(activate: activate)
+    }
+
+    private func sessionEndedByUI() {
+        sessionMask = nil
+        tap.updateRouting { $0.sessionActive = false }
+        updatePolling()
     }
 
     // MARK: Toast
     private var toast: ToastPanel?
 
     func announceEnabledState() {
-        let text = SettingsStore.shared.enabled ? "SwitchMux 已启用" : "SwitchMux 已暂停"
-        toast?.orderOut(nil)
-        let panel = ToastPanel(text: text)
-        toast = panel
-        panel.present()
+        showToast(SettingsStore.shared.enabled ? "SwitchMux 应用栏已启用" : "SwitchMux 应用栏已暂停")
     }
 
     func showToast(_ text: String) {

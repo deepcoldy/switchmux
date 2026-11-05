@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Combine
 
 /// Owns the App Bar window: building slots, positioning, keyboard / mouse
 /// handling, hover-to-switch and custom-mode drag reordering.
@@ -16,35 +17,41 @@ final class AppBarController {
     private var pressedKey: String?
     private var hoveredKey: String?
     private var draggingKey: String?
+    private var cancellables = Set<AnyCancellable>()
 
     private init() {
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(settingsChanged),
-            name: UserDefaults.didChangeNotification, object: nil)
-    }
-
-    @objc private func settingsChanged() {
-        if isVisible { relayout() }
+        // Live-apply list / appearance edits while the bar is up.
+        SettingsStore.shared.objectWillChange
+            .debounce(for: .milliseconds(30), scheduler: RunLoop.main)
+            .sink { [weak self] in
+                guard let self, self.isVisible, self.draggingKey == nil else { return }
+                self.relayout()
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: Screen selection
     private static func frontmostScreen() -> NSScreen? {
         guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
         let app = AXUIElementCreateApplication(frontPID)
+        AXUIElementSetMessagingTimeout(app, 0.2)
         var window: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &window) == .success,
-              let windowRef = window else { return nil }
+              let windowRef = window, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { return nil }
         var positionRef: CFTypeRef?
         var sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(windowRef as! AXUIElement, kAXPositionAttribute as CFString, &positionRef) == .success,
               AXUIElementCopyAttributeValue(windowRef as! AXUIElement, kAXSizeAttribute as CFString, &sizeRef) == .success,
-              let positionRef, let sizeRef else { return nil }
+              let positionRef, let sizeRef,
+              CFGetTypeID(positionRef) == AXValueGetTypeID(), CFGetTypeID(sizeRef) == AXValueGetTypeID() else { return nil }
         var point = CGPoint.zero
         var size = CGSize.zero
         guard AXValueGetValue(positionRef as! AXValue, .cgPoint, &point),
               AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) else { return nil }
-        let windowFrame = CGRect(origin: point, size: size)
-        return NSScreen.screens.first { $0.frame.intersects(windowFrame) }
+        // AX uses top-left-origin global coordinates; convert to Cocoa's.
+        guard let primary = NSScreen.screens.first else { return nil }
+        let center = NSPoint(x: point.x + size.width / 2, y: primary.frame.maxY - (point.y + size.height / 2))
+        return NSScreen.screens.first { $0.frame.contains(center) }
     }
 
     private func targetScreen() -> NSScreen {
@@ -53,7 +60,7 @@ final class AppBarController {
            let s = Self.frontmostScreen() ?? NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) {
             return s
         }
-        return NSScreen.main ?? screens.first!
+        return NSScreen.main ?? screens[0]
     }
 
     // MARK: Show / hide
@@ -63,11 +70,7 @@ final class AppBarController {
 
     private func show(on screen: NSScreen) {
         guard !isVisible else { return }
-        let profile = SettingsStore.shared.activeProfile
-        slots = AppsMonitor.shared.slots(for: profile)
-        if ProcessInfo.processInfo.environment["SWITCHMUX_TRACE"] != nil {
-            NSLog("TRACE show slots=\(slots.count) mode=\(profile.mode)")
-        }
+        slots = AppsMonitor.shared.slots()
         guard !slots.isEmpty else { return }
         buildWindowIfNeeded()
         rebuildItems()
@@ -81,9 +84,19 @@ final class AppBarController {
         scheduleHideAfter()
     }
 
+    /// Settings "预览": show the bar briefly with the current appearance.
+    func preview() {
+        show()
+        previewWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        previewWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
+    }
+    private var previewWork: DispatchWorkItem?
+
     /// Debug hook (SWITCHMUX_SMOKE): show the bar immediately.
     func smokeShow() {
-        show(on: NSScreen.screens.first!)
+        show(on: NSScreen.screens[0])
     }
 
     /// Debug hook: rasterize the bar to a PNG without screen-capture permission.
@@ -145,25 +158,19 @@ final class AppBarController {
         let delay = SettingsStore.shared.hideAfter
         guard delay > 0 else { return }
         hideAfterTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            self?.isVisible = false
-            self?.hoveredKey = nil
-            self?.panel?.orderOut(nil)
+            self?.hide(activateHovered: false)
         }
     }
 
     /// Called when running-app state changes; refreshes chrome while visible.
     func reloadIfVisible() {
-        guard isVisible else { return }
-        let profile = SettingsStore.shared.activeProfile
-        slots = AppsMonitor.shared.slots(for: profile)
-        rebuildItems(keepWindow: true)
-        positionPanel(on: panel?.screen ?? targetScreen())
+        relayout()
     }
 
     private func relayout() {
         guard isVisible else { return }
-        let profile = SettingsStore.shared.activeProfile
-        slots = AppsMonitor.shared.slots(for: profile)
+        slots = AppsMonitor.shared.slots()
+        if slots.isEmpty { hide(); return }
         rebuildItems(keepWindow: true)
         positionPanel(on: panel?.screen ?? targetScreen())
     }
@@ -234,7 +241,7 @@ final class AppBarController {
 
     // MARK: Item views
     private func rebuildItems(keepWindow: Bool = false) {
-        guard let panel, let effectView else { return }
+        guard let effectView else { return }
         let m = BarMetrics.current
         configureEffect()
 
@@ -253,12 +260,12 @@ final class AppBarController {
             } else {
                 view = makeItemView(slot: slot, metrics: m)
             }
+            view.borderWidth = CGFloat(SettingsStore.shared.borderWidth)
             view.frame = NSRect(x: x, y: m.barPaddingY, width: m.tileWidth, height: m.tileHeight)
             effectView.addSubview(view)
             itemViews.append(view)
             x += m.tileWidth + m.tileSpacing
         }
-        _ = panel
     }
 
     private func makeItemView(slot: Slot, metrics m: BarMetrics) -> AppBarItemView {
@@ -279,47 +286,21 @@ final class AppBarController {
                 self.hoveredKey = nil
             }
         }
-        if SettingsStore.shared.activeProfile.mode == .custom {
-            view.onDragBegan = { [weak self] _ in self?.draggingKey = slot.key }
-            view.onDragMoved = { [weak self] point in self?.handleDrag(to: point) }
-            view.onDragEnded = { [weak self] in self?.draggingKey = nil }
-        }
+        view.onDragBegan = { [weak self] _ in self?.draggingKey = slot.key }
+        view.onDragMoved = { [weak self] point in self?.handleDrag(to: point) }
+        view.onDragEnded = { [weak self] in self?.draggingKey = nil }
         return view
     }
 
     // MARK: Keyboard
-    /// Returns true if the key was handled (and should be swallowed).
-    func handleKeyDown(_ event: NSEvent) -> Bool {
-        if isVisible {
-            if event.isARepeat { return true }
-            guard let ch = event.charactersIgnoringModifiers?.lowercased(), !ch.isEmpty else { return false }
-            if shortcutDisabledForFrontmost { return false }
-            guard let slot = slots.first(where: { $0.character == ch }) else { return false }
-            flash(slotKey: slot.key)
-            trigger(slot)
-            return true
-        }
-        // Bar set to "never display": resolve the slot without UI.
-        return blindTrigger(event)
-    }
-
-    private var shortcutDisabledForFrontmost: Bool {
-        if let bid = AppsMonitor.shared.frontmost?.bundleIdentifier,
-           let entry = SettingsStore.shared.silentEntry(for: bid),
-           entry.disableShortcuts {
-            return true
-        }
-        return false
-    }
-
-    private func blindTrigger(_ event: NSEvent) -> Bool {
-        guard let ch = event.charactersIgnoringModifiers?.lowercased(), !ch.isEmpty else { return false }
-        if shortcutDisabledForFrontmost { return false }
-        let profile = SettingsStore.shared.activeProfile
-        let slots = AppsMonitor.shared.slots(for: profile)
-        guard let slot = slots.first(where: { $0.character == ch }) else { return false }
+    /// A bound key was pressed while the activation modifier is held (the
+    /// event tap already checked modifiers and silent rules). Works whether
+    /// or not the bar is visible ("never display" = blind shortcuts).
+    func triggerKey(_ keyCode: UInt16) {
+        let current = isVisible ? slots : AppsMonitor.shared.slots()
+        guard let slot = current.first(where: { $0.keyCode == keyCode }) else { return }
+        if isVisible { flash(slotKey: slot.key) }
         trigger(slot)
-        return true
     }
 
     private func flash(slotKey: String) {
@@ -334,38 +315,28 @@ final class AppBarController {
 
     private func trigger(_ slot: Slot) {
         AppActivator.trigger(slot, allowHide: SettingsStore.shared.hideOnRepeat)
-        SettingsStore.shared.recordActivation(slot.bundleID ?? slot.url.path)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        SettingsStore.shared.recordUsage()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             self?.reloadIfVisible()
         }
     }
 
-    // MARK: Custom-mode reordering
+    // MARK: Drag to reorder
     private func handleDrag(to screenPoint: NSPoint) {
-        guard draggingKey != nil else { return }
-        guard var profile = SettingsStore.shared.profiles.first(where: {
-            $0.id == SettingsStore.shared.activeProfileID
-        }) ?? Optional(SettingsStore.shared.activeProfile) else { return }
-        guard profile.mode == .custom else { return }
-
-        // Hit test by screen rects.
+        guard let draggingKey else { return }
         var targetIndex: Int?
         for (idx, view) in itemViews.enumerated() where view.slotKey != draggingKey {
             guard let window = view.window else { continue }
-            let inWindow = view.convert(view.bounds, to: nil)
-            let rect = window.convertToScreen(inWindow)
+            let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
             if rect.contains(screenPoint) { targetIndex = idx; break }
         }
+        var apps = SettingsStore.shared.apps
         guard let targetIndex,
-              let from = profile.actions.firstIndex(where: { "custom:\($0.id.uuidString):\($0.bundleID ?? $0.path)" == draggingKey })
-        else { return }
-        let action = profile.actions.remove(at: from)
-        var to = targetIndex
-        if from < to { to -= 1 }
-        to = max(0, min(to, profile.actions.count))
-        guard to != from else { return }
-        profile.actions.insert(action, at: to)
-        SettingsStore.shared.update(profile)
+              let from = apps.firstIndex(where: { $0.id.uuidString == draggingKey }),
+              targetIndex != from else { return }
+        let entry = apps.remove(at: from)
+        apps.insert(entry, at: min(targetIndex, apps.count))
+        SettingsStore.shared.apps = apps
         relayout()
     }
 }

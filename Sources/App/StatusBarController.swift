@@ -36,24 +36,17 @@ final class StatusBarController: NSObject {
         let settings = SettingsStore.shared
         menu.removeAllItems()
 
-        // Profile switcher
-        let profileMenu = NSMenu()
-        for p in settings.profiles.sorted(by: { $0.sortOrder < $1.sortOrder }) {
-            let item = NSMenuItem(title: p.name, action: #selector(switchProfile(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = p.id == settings.activeProfile.id ? .on : .off
-            item.representedObject = p.id.uuidString
-            profileMenu.addItem(item)
-        }
-        let profileItem = NSMenuItem(title: "配置", action: nil, keyEquivalent: "")
-        profileItem.submenu = profileMenu
-        menu.addItem(profileItem)
-
-        let enabledItem = NSMenuItem(title: "启用 SwitchMux",
+        let enabledItem = NSMenuItem(title: "启用应用栏（按住 \(settings.activateModifiers.symbols)）",
                                      action: #selector(toggleEnabled), keyEquivalent: "")
         enabledItem.target = self
         enabledItem.state = settings.enabled ? .on : .off
         menu.addItem(enabledItem)
+
+        let switcherItem = NSMenuItem(title: "窗口切换（\(settings.windowSwitcherModifier.symbol)Tab）",
+                                      action: #selector(toggleWindowSwitcher), keyEquivalent: "")
+        switcherItem.target = self
+        switcherItem.state = settings.windowSwitcherEnabled ? .on : .off
+        menu.addItem(switcherItem)
 
         // Silent-mode toggle for the current frontmost app
         if let front = NSWorkspace.shared.frontmostApplication,
@@ -61,7 +54,7 @@ final class StatusBarController: NSObject {
            bid != Bundle.main.bundleIdentifier {
             let name = front.localizedName ?? "当前应用"
             let isSilent = settings.silentEntry(for: bid) != nil
-            let title = isSilent ? "将「\(name)」移出静默模式" : "将「\(name)」加入静默模式"
+            let title = isSilent ? "将「\(name)」移出例外" : "在「\(name)」中不弹出应用栏"
             let item = NSMenuItem(title: title, action: #selector(toggleSilentForFrontmost), keyEquivalent: "")
             item.target = self
             menu.addItem(item)
@@ -117,14 +110,13 @@ final class StatusBarController: NSObject {
         menu.addItem(quitItem)
     }
 
-    @objc private func switchProfile(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String, let id = UUID(uuidString: s) else { return }
-        SettingsStore.shared.activeProfileID = id
-    }
-
     @objc private func toggleEnabled() {
         SettingsStore.shared.enabled.toggle()
         HotkeyController.shared.announceEnabledState()
+    }
+
+    @objc private func toggleWindowSwitcher() {
+        SettingsStore.shared.windowSwitcherEnabled.toggle()
     }
 
     @objc private func toggleSilentForFrontmost() {

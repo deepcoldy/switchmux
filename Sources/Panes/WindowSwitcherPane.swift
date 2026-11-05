@@ -7,102 +7,99 @@ struct WindowSwitcherPane: View {
 
     var body: some View {
         Form {
-            Section("窗口缩略图切换器") {
-                Toggle("启用窗口切换热键", isOn: $settings.windowSwitcherEnabled)
-                Text("按住激活修饰键再按 Tab 才会弹出窗口缩略图；单独按修饰键不影响 ⌘C、⌘V 等常规快捷键。Tab / 方向键或数字选择，松开激活。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Section {
+                Toggle(isOn: $settings.windowSwitcherEnabled) {
+                    Text("\(settings.windowSwitcherModifier.symbol) Tab 切换所有窗口")
+                }
+                if settings.windowSwitcherEnabled {
+                    Picker("修饰键", selection: $settings.windowSwitcherModifier) {
+                        ForEach(SwitcherModifier.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("显示", selection: $settings.windowScope) {
+                        ForEach(WindowScope.allCases) { Text($0.label).tag($0) }
+                    }
+                    Toggle("包含最小化的窗口", isOn: $settings.includeMinimizedWindows)
+                    Toggle("包含已隐藏应用的窗口", isOn: $settings.includeHiddenAppWindows)
+                }
+            } header: {
+                Text("窗口切换")
+            } footer: {
+                Text(windowFooter).font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("激活热键") {
-                Text("修饰键 + Tab 触发（建议与 App Bar 激活键区分开）：")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)],
-                          alignment: .leading, spacing: 8) {
-                    modifierToggle("⇧ Shift", .shift)
-                    modifierToggle("⌃ Control", .control)
-                    modifierToggle("⌥ Option", .option)
-                    modifierToggle("⌘ Command", .command)
+            Section {
+                Toggle(isOn: $settings.appWindowSwitcherEnabled) {
+                    Text("\(settings.appWindowSwitcherModifier.symbol) ` 在当前应用的窗口之间切换")
                 }
-                .frame(maxWidth: 420)
-                if settings.windowSwitcherModifiers.intersection([.shift, .control, .option, .command]).isEmpty
-                    || settings.windowSwitcherModifiers == settings.activateModifiers {
-                    Text("需要至少一个修饰键，且不能与 App Bar 激活键相同。")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                if settings.appWindowSwitcherEnabled {
+                    Picker("修饰键", selection: $settings.appWindowSwitcherModifier) {
+                        ForEach(SwitcherModifier.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
                 }
+            } header: {
+                Text("同一应用的窗口")
+            } footer: {
+                Text("` 是 Tab 上方的键。快速按一下切到该应用上一个使用的窗口，按住可浏览全部窗口；加 ⇧ 反向。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("范围") {
-                Picker("显示窗口", selection: $settings.windowScope) {
-                    ForEach(WindowScope.allCases) { scope in
-                        Text(scope.label).tag(scope)
+            Section("缩略图") {
+                LabeledContent("大小") {
+                    HStack {
+                        Slider(value: $settings.windowSwitcherScale, in: 0.8...1.4, step: 0.05)
+                            .frame(maxWidth: 260)
+                        Text("\(Int(settings.windowSwitcherScale * 100))%")
+                            .monospacedDigit().foregroundStyle(.secondary)
+                            .frame(width: 48, alignment: .trailing)
                     }
                 }
-                .pickerStyle(.radioGroup)
-                Toggle("包含最小化的窗口", isOn: $settings.includeMinimizedWindows)
-                Toggle("包含已隐藏应用的窗口", isOn: $settings.includeHiddenAppWindows)
-            }
-
-            Section("外观") {
-                VStack(alignment: .leading) {
-                    Text("缩略图大小：\(Int(settings.windowSwitcherScale * 100))%")
-                    Slider(value: $settings.windowSwitcherScale, in: 0.8...1.4, step: 0.05)
-                }
-            }
-
-            Section("屏幕录制权限") {
-                LabeledContent("窗口缩略图") {
+                LabeledContent("屏幕录制权限") {
                     HStack {
                         Circle()
                             .fill(model.screenRecording ? Color.green : Color.orange)
-                            .frame(width: 9, height: 9)
-                        Text(model.screenRecording ? "已授权" : "未授权（将显示应用图标代替）")
+                            .frame(width: 8, height: 8)
+                        Text(model.screenRecording ? "已授权" : "未授权（显示应用图标）")
                             .foregroundStyle(.secondary)
-                        Button("打开系统设置") { model.guide() }
-                        Button("在访达中显示") { PrefsSupport.revealAppInFinder() }
+                        if !model.screenRecording {
+                            Button("去授权") { model.guide() }
+                        }
                     }
                 }
-                Text("缩略图需要「系统设置 → 隐私与安全性 → 屏幕录制」；不授权也可正常切换。缩略图由独立的捕获子进程完成，授权后无需重启 SwitchMux，下次 ⌘+Tab 即显示真实缩略图。若列表没有 SwitchMux，请把访达中高亮的图标拖入并打开开关。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
-            Section("操作速查") {
+            Section("切换器中的按键") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("按住修饰键按 Tab 呼出并前移；⇧+Tab 后移，方向键导航，数字键 1–0 直达")
-                    Text("Q：退出应用　W：关闭窗口　H：隐藏应用　M：最小化")
-                    Text("回车：立即激活　Esc：取消　松开修饰键：激活所选窗口")
-                    Text("单独按修饰键不弹窗，不影响 ⌘C / ⌘V 等常规快捷键")
+                    shortcut("Tab / ⇧Tab、方向键", "移动选择")
+                    shortcut("1 – 0", "直接选中第 1–10 个")
+                    shortcut("松开修饰键 / 回车 / 点击", "切换到所选窗口")
+                    shortcut("Esc", "取消")
+                    shortcut("Q · W · H · M", "退出应用 · 关闭窗口 · 隐藏应用 · 最小化")
                 }
                 .font(.caption)
-                .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .onAppear {
-            model.screenRecording = ScreenCapturePermission.status
-            model.startPolling()
-        }
+        .onAppear { model.startPolling() }
         .onDisappear { model.stopPolling() }
     }
 
-    private func modifierToggle(_ title: String, _ flag: NSEvent.ModifierFlags) -> some View {
-        let isOn = Binding<Bool>(
-            get: { settings.windowSwitcherModifiers.contains(flag) },
-            set: { on in
-                if on { settings.windowSwitcherModifiers.insert(flag) }
-                else { settings.windowSwitcherModifiers.remove(flag) }
-            }
-        )
-        return HStack(spacing: 12) {
-            Text(title)
-            Toggle("", isOn: isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
+    private var windowFooter: String {
+        guard settings.windowSwitcherEnabled else {
+            return "已关闭：⌘Tab 由系统原生切换器处理。"
         }
-        .fixedSize(horizontal: true, vertical: false)
+        if settings.windowSwitcherModifier == .command {
+            return "SwitchMux 会接管系统的 ⌘Tab：快速按一下切换到上一个窗口，按住可浏览所有窗口的缩略图。关闭此项或退出 SwitchMux 会立即恢复系统 ⌘Tab。"
+        }
+        return "系统 ⌘Tab 保持不变；\(settings.windowSwitcherModifier.symbol)Tab 打开 SwitchMux 的窗口切换器。"
+    }
+
+    private func shortcut(_ key: String, _ action: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(key).fontWeight(.medium).frame(width: 170, alignment: .leading)
+            Text(action).foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -111,19 +108,16 @@ final class WindowSwitcherPaneModel: ObservableObject {
     private var timer: Timer?
 
     func guide() {
-        ScreenCapturePermission.request()
         PrefsSupport.guideToScreenRecording()
-        // The helper probes the live TCC state, so the indicator flips green
-        // immediately after the grant without restarting SwitchMux.
-        scheduleRefresh()
+        for t in [0.8, 1.6, 3.0, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in self?.poll() }
+        }
     }
 
     func startPolling() {
         timer?.invalidate()
         poll()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.poll()
-        }
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.poll() }
     }
 
     func stopPolling() {
@@ -131,21 +125,15 @@ final class WindowSwitcherPaneModel: ObservableObject {
         timer = nil
     }
 
+    /// The helper probes the live TCC state, so the indicator flips green
+    /// right after the grant without restarting SwitchMux.
     private func poll() {
         if WindowCapture.isAvailable {
             WindowCapture.probe { [weak self] granted in
                 DispatchQueue.main.async { self?.screenRecording = granted }
             }
         } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.screenRecording = ScreenCapturePermission.status
-            }
-        }
-    }
-
-    private func scheduleRefresh() {
-        for t in [0.8, 1.6, 3.0, 6.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in self?.poll() }
+            screenRecording = ScreenCapturePermission.status
         }
     }
 }

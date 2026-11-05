@@ -2,30 +2,26 @@ import AppKit
 import SwiftUI
 
 enum PrefsPane: String, CaseIterable, Identifiable {
-    case general, profiles, customApps, windowSwitcher, appearance, advanced, silent, usage, about
+    case general, apps, appBar, windowSwitcher, silent, usage, about
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .general: return "通用"
-        case .profiles: return "配置"
-        case .customApps: return "应用"
+        case .apps: return "应用"
+        case .appBar: return "应用栏"
         case .windowSwitcher: return "窗口切换"
-        case .appearance: return "外观"
-        case .advanced: return "高级"
-        case .silent: return "静默模式"
-        case .usage: return "用量"
+        case .silent: return "例外"
+        case .usage: return "统计"
         case .about: return "关于"
         }
     }
     var icon: String {
         switch self {
         case .general: return "gearshape"
-        case .profiles: return "square.grid.2x2"
-        case .customApps: return "square.and.pencil"
+        case .apps: return "square.grid.2x2"
+        case .appBar: return "dock.rectangle"
         case .windowSwitcher: return "rectangle.on.rectangle.angled"
-        case .appearance: return "paintbrush"
-        case .advanced: return "slider.horizontal.3"
         case .silent: return "moon.zzz"
         case .usage: return "chart.bar.fill"
         case .about: return "info.circle"
@@ -37,12 +33,12 @@ final class PreferencesWindowController: NSWindowController {
     static let shared = PreferencesWindowController()
 
     private let toolbar = NSToolbar(identifier: "SwitchMuxPrefsToolbar")
-    private var pane: PrefsPane = .general
+    private var pane: PrefsPane = .apps
     private var hosting: NSHostingView<AnyView>?
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: Self.size.width, height: Self.size.height),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false)
         window.title = "SwitchMux 设置"
@@ -52,8 +48,10 @@ final class PreferencesWindowController: NSWindowController {
         toolbar.allowsUserCustomization = false
         toolbar.displayMode = .iconAndLabel
         window.toolbar = toolbar
-        select(.general)
+        select(.apps)
     }
+
+    static let size = NSSize(width: 760, height: 540)
 
     func showWindow(_ pane: PrefsPane? = nil) {
         if let pane { select(pane) }
@@ -62,25 +60,25 @@ final class PreferencesWindowController: NSWindowController {
         window?.makeKeyAndOrderFront(nil)
     }
 
-    fileprivate func select(_ pane: PrefsPane) {        self.pane = pane
+    fileprivate func select(_ pane: PrefsPane) {
+        self.pane = pane
+        if pane != .apps { ShortcutRecorder.shared.cancel() }
         toolbar.selectedItemIdentifier = NSToolbarItem.Identifier(pane.rawValue)
         window?.title = pane.title
 
         let rootView: AnyView
         switch pane {
         case .general: rootView = AnyView(GeneralPane())
-        case .profiles: rootView = AnyView(ProfilesPane())
-        case .customApps: rootView = AnyView(CustomAppsPane())
+        case .apps: rootView = AnyView(AppsPane())
+        case .appBar: rootView = AnyView(AppBarPane())
         case .windowSwitcher: rootView = AnyView(WindowSwitcherPane())
-        case .appearance: rootView = AnyView(AppearancePane())
-        case .advanced: rootView = AnyView(AdvancedPane())
         case .silent: rootView = AnyView(SilentPane())
         case .usage: rootView = AnyView(UsagePane())
         case .about: rootView = AnyView(AboutPane())
         }
         let framed = AnyView(
             rootView
-                .frame(width: 720, height: 500)
+                .frame(width: Self.size.width, height: Self.size.height)
                 .environmentObject(SettingsStore.shared)
         )
         let host = NSHostingView(rootView: framed)

@@ -4,37 +4,48 @@ import ServiceManagement
 import Combine
 
 /// Snapshot of every persisted setting (synced as one JSON file via ConfigSync).
+///
+/// Every field is optional so configs written by any older or newer build
+/// decode. When saving, the legacy (≤ 1.1) fields are still filled in so an
+/// older SwitchMux on another Mac sharing the iCloud config keeps working.
 struct SettingsSnapshot: Codable {
-    var profiles: [Profile]
-    var activeProfileID: UUID?
-    var enabled: Bool
-    var activateModifiers: UInt
-    var displayDelay: Double
-    var hideAfter: Double
-    var hideOnRepeat: Bool
-    var showOnActiveScreen: Bool
-    var switchByReleasing: Bool
-    var doublePressToggle: Bool
-    var switcherFilter: [String]
-    var windowSwitcherEnabled: Bool
-    var windowSwitcherModifiers: UInt
-    var windowScope: String
-    var includeMinimizedWindows: Bool
-    var includeHiddenAppWindows: Bool
-    var windowSwitcherScale: Double
-    var barSizeScale: Double
-    var barOpacity: Double
-    var borderWidth: Double
-    var verticalPosition: String
-    var horizontalPosition: String
-    var silentApps: [SilentEntry]
-    var mruBundleIDs: [String]
-    var usageCount: Int
-    var usageByDay: [String: Int]
-    var welcomeShown: Bool
-    var showStatusIcon: Bool
-    // Optional so adding it does not break decoding of older synced configs.
+    // Current model
+    var apps: [AppEntry]?
+    var appWindowSwitcherEnabled: Bool?
+    var appWindowSwitcherModifiers: UInt?
+
+    // Shared with older builds
+    var enabled: Bool?
+    var activateModifiers: UInt?
+    var displayDelay: Double?
+    var hideAfter: Double?
+    var hideOnRepeat: Bool?
+    var showOnActiveScreen: Bool?
+    var switchByReleasing: Bool?
+    var doublePressToggle: Bool?
+    var windowSwitcherEnabled: Bool?
+    var windowSwitcherModifiers: UInt?
+    var windowScope: String?
+    var includeMinimizedWindows: Bool?
+    var includeHiddenAppWindows: Bool?
+    var windowSwitcherScale: Double?
+    var barSizeScale: Double?
+    var barOpacity: Double?
+    var borderWidth: Double?
+    var verticalPosition: String?
+    var horizontalPosition: String?
+    var silentApps: [SilentEntry]?
+    var usageCount: Int?
+    var usageByDay: [String: Int]?
+    var welcomeShown: Bool?
+    var showStatusIcon: Bool?
     var autoUpdateCheck: Bool?
+
+    // Legacy only (read for migration, written for backward compatibility)
+    var profiles: [LegacyProfile]?
+    var activeProfileID: UUID?
+    var switcherFilter: [String]?
+    var mruBundleIDs: [String]?
 }
 
 /// All user-facing settings. Persistence is a single JSON snapshot kept by
@@ -43,37 +54,15 @@ struct SettingsSnapshot: Codable {
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
+    private static let legacyProfileID = UUID(uuidString: "5D1C0A55-0000-4000-8000-000000000001")!
+
     private var saveWorkItem: DispatchWorkItem?
     private var applyingExternal = false
+    private var observerBag = Set<AnyCancellable>()
+    private var needsMigrationSave = false
 
-    // MARK: Profiles
-    @Published var profiles: [Profile]
-    @Published var activeProfileID: UUID?
-
-    var activeProfile: Profile {
-        get {
-            if let id = activeProfileID, let p = profiles.first(where: { $0.id == id }) { return p }
-            return profiles.sorted { $0.sortOrder < $1.sortOrder }.first ?? profiles[0]
-        }
-        set {
-            if let idx = profiles.firstIndex(where: { $0.id == newValue.id }) {
-                profiles[idx] = newValue
-            }
-            activeProfileID = newValue.id
-        }
-    }
-
-    func profile(_ id: UUID) -> Profile? {
-        profiles.first { $0.id == id }
-    }
-
-    func update(_ profile: Profile) {
-        if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
-            profiles[idx] = profile
-        }
-    }
-
-    // MARK: Behavior
+    // MARK: App Bar
+    @Published var apps: [AppEntry]
     @Published var enabled: Bool
     @Published var activateModifiers: NSEvent.ModifierFlags
     /// Delay before the App Bar appears. -1 = never (blind shortcuts only).
@@ -83,11 +72,12 @@ final class SettingsStore: ObservableObject {
     @Published var showOnActiveScreen: Bool
     @Published var switchByReleasing: Bool
     @Published var doublePressToggle: Bool
-    @Published var switcherFilter: [String]
 
-    // MARK: Window switcher
+    // MARK: Window switchers
     @Published var windowSwitcherEnabled: Bool
-    @Published var windowSwitcherModifiers: NSEvent.ModifierFlags
+    @Published var windowSwitcherModifier: SwitcherModifier
+    @Published var appWindowSwitcherEnabled: Bool
+    @Published var appWindowSwitcherModifier: SwitcherModifier
     @Published var windowScope: WindowScope
     @Published var includeMinimizedWindows: Bool
     @Published var includeHiddenAppWindows: Bool
@@ -102,12 +92,15 @@ final class SettingsStore: ObservableObject {
 
     // MARK: Silent / misc
     @Published var silentApps: [SilentEntry]
-    @Published var mruBundleIDs: [String]
     @Published var usageCount: Int
     @Published var usageByDay: [String: Int]
     @Published var welcomeShown: Bool
     @Published var showStatusIcon: Bool
     @Published var autoUpdateCheck: Bool
+
+    /// Most-recently-activated bundle IDs. In-memory only: it changes on every
+    /// app switch and must not churn the synced config file.
+    private(set) var mruBundleIDs: [String] = []
 
     var launchAtLogin: Bool {
         get { SMAppService.mainApp.status == .enabled }
@@ -122,16 +115,14 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    // MARK: Defaults
+    static let defaultBarSizeScale = 1.0
+    static let defaultBarOpacity = 0.95
+    static let defaultBorderWidth = 3.0
+
     // MARK: Init
     private init() {
-        // 1. Built-in defaults (also the migration source shape).
-        let defaultsProfiles = [
-            Profile(name: "Dock", mode: .dock, sortOrder: 0, characters: "1234567890"),
-            Profile(name: "Switcher", mode: .switcher, sortOrder: 1, characters: "1234567890"),
-            Profile(name: "自定义配置 1", mode: .custom, sortOrder: 2, characters: "1234567890"),
-        ]
-        profiles = defaultsProfiles
-        activeProfileID = defaultsProfiles.first?.id
+        apps = []
         enabled = true
         activateModifiers = .option
         displayDelay = 0.15
@@ -140,39 +131,39 @@ final class SettingsStore: ObservableObject {
         showOnActiveScreen = true
         switchByReleasing = true
         doublePressToggle = true
-        switcherFilter = []
         windowSwitcherEnabled = true
-        windowSwitcherModifiers = .command
+        windowSwitcherModifier = .command
+        appWindowSwitcherEnabled = true
+        appWindowSwitcherModifier = .option
         windowScope = .allWindows
         includeMinimizedWindows = true
         includeHiddenAppWindows = true
         windowSwitcherScale = 1.0
-        barSizeScale = 1.0
-        barOpacity = 0.95
-        borderWidth = 3
+        barSizeScale = Self.defaultBarSizeScale
+        barOpacity = Self.defaultBarOpacity
+        borderWidth = Self.defaultBorderWidth
         verticalPosition = .middle
         horizontalPosition = .center
         silentApps = []
-        mruBundleIDs = []
         usageCount = 0
         usageByDay = [:]
         welcomeShown = false
         showStatusIcon = true
         autoUpdateCheck = true
 
-        // JSON snapshot (iCloud Drive / Application Support) wins if present.
         if let snap = ConfigSync.shared.load(SettingsSnapshot.self) {
             apply(snap)
+            if needsMigrationSave { scheduleSave() }
         } else {
+            // First run: start from the Dock with Finder first.
+            apps = Self.dockEntries(includeFinder: true)
             scheduleSave()
         }
 
-        // Debounced whole-snapshot persistence.
         objectWillChange
             .sink { [weak self] in self?.scheduleSave() }
             .store(in: &observerBag)
 
-        // Live reload when the file changes (another Mac / another process).
         ConfigSync.shared.onChange = { [weak self] in
             guard let self,
                   let snap = ConfigSync.shared.load(SettingsSnapshot.self) else { return }
@@ -182,8 +173,6 @@ final class SettingsStore: ObservableObject {
         }
         ConfigSync.shared.watch()
     }
-
-    private var observerBag = Set<AnyCancellable>()
 
     private func scheduleSave() {
         guard !applyingExternal else { return }
@@ -196,10 +185,14 @@ final class SettingsStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
-    private func snapshot() -> SettingsSnapshot {
-        SettingsSnapshot(
-            profiles: profiles,
-            activeProfileID: activeProfileID,
+    func snapshot() -> SettingsSnapshot {
+        let legacy = LegacyProfile(id: Self.legacyProfileID, name: "自定义配置", mode: "custom",
+                                   sortOrder: 0, actions: apps, characters: "1234567890",
+                                   includeFinder: false)
+        return SettingsSnapshot(
+            apps: apps,
+            appWindowSwitcherEnabled: appWindowSwitcherEnabled,
+            appWindowSwitcherModifiers: appWindowSwitcherModifier.flags.rawValue,
             enabled: enabled,
             activateModifiers: activateModifiers.rawValue,
             displayDelay: displayDelay,
@@ -208,9 +201,8 @@ final class SettingsStore: ObservableObject {
             showOnActiveScreen: showOnActiveScreen,
             switchByReleasing: switchByReleasing,
             doublePressToggle: doublePressToggle,
-            switcherFilter: switcherFilter,
             windowSwitcherEnabled: windowSwitcherEnabled,
-            windowSwitcherModifiers: windowSwitcherModifiers.rawValue,
+            windowSwitcherModifiers: windowSwitcherModifier.flags.rawValue,
             windowScope: windowScope.rawValue,
             includeMinimizedWindows: includeMinimizedWindows,
             includeHiddenAppWindows: includeHiddenAppWindows,
@@ -221,87 +213,187 @@ final class SettingsStore: ObservableObject {
             verticalPosition: verticalPosition.rawValue,
             horizontalPosition: horizontalPosition.rawValue,
             silentApps: silentApps,
-            mruBundleIDs: mruBundleIDs,
             usageCount: usageCount,
             usageByDay: usageByDay,
             welcomeShown: welcomeShown,
             showStatusIcon: showStatusIcon,
-            autoUpdateCheck: autoUpdateCheck
+            autoUpdateCheck: autoUpdateCheck,
+            profiles: [legacy],
+            activeProfileID: legacy.id,
+            switcherFilter: [],
+            mruBundleIDs: []
         )
     }
 
     private func apply(_ s: SettingsSnapshot) {
-        guard !s.profiles.isEmpty else { return }
-        profiles = s.profiles
-        activeProfileID = s.activeProfileID
-        enabled = s.enabled
-        activateModifiers = NSEvent.ModifierFlags(rawValue: s.activateModifiers)
-        displayDelay = s.displayDelay
-        hideAfter = s.hideAfter
-        hideOnRepeat = s.hideOnRepeat
-        showOnActiveScreen = s.showOnActiveScreen
-        switchByReleasing = s.switchByReleasing
-        doublePressToggle = s.doublePressToggle
-        switcherFilter = s.switcherFilter
-        windowSwitcherEnabled = s.windowSwitcherEnabled
-        windowSwitcherModifiers = NSEvent.ModifierFlags(rawValue: s.windowSwitcherModifiers)
-        windowScope = WindowScope(rawValue: s.windowScope) ?? .allWindows
-        includeMinimizedWindows = s.includeMinimizedWindows
-        includeHiddenAppWindows = s.includeHiddenAppWindows
-        windowSwitcherScale = s.windowSwitcherScale
-        barSizeScale = s.barSizeScale
-        barOpacity = s.barOpacity
-        borderWidth = s.borderWidth
-        verticalPosition = BarVerticalPosition(rawValue: s.verticalPosition) ?? .middle
-        horizontalPosition = BarHorizontalPosition(rawValue: s.horizontalPosition) ?? .center
-        silentApps = s.silentApps
-        mruBundleIDs = s.mruBundleIDs
-        usageCount = s.usageCount
-        usageByDay = s.usageByDay
-        welcomeShown = s.welcomeShown
-        showStatusIcon = s.showStatusIcon
-        autoUpdateCheck = s.autoUpdateCheck ?? true
+        if let a = s.apps {
+            apps = Self.sanitized(a)
+        } else if let profiles = s.profiles, !profiles.isEmpty {
+            apps = Self.sanitized(Self.migrate(profiles: profiles, activeID: s.activeProfileID))
+            needsMigrationSave = true
+        }
+        enabled = s.enabled ?? enabled
+        if let m = s.activateModifiers {
+            let flags = NSEvent.ModifierFlags(rawValue: m).intersection(KeyChord.relevant)
+            activateModifiers = flags.isEmpty ? .option : flags
+        }
+        displayDelay = s.displayDelay ?? displayDelay
+        hideAfter = s.hideAfter ?? hideAfter
+        hideOnRepeat = s.hideOnRepeat ?? hideOnRepeat
+        showOnActiveScreen = s.showOnActiveScreen ?? showOnActiveScreen
+        switchByReleasing = s.switchByReleasing ?? switchByReleasing
+        doublePressToggle = s.doublePressToggle ?? doublePressToggle
+        windowSwitcherEnabled = s.windowSwitcherEnabled ?? windowSwitcherEnabled
+        if let m = s.windowSwitcherModifiers {
+            windowSwitcherModifier = SwitcherModifier(flags: NSEvent.ModifierFlags(rawValue: m), default: .command)
+        }
+        appWindowSwitcherEnabled = s.appWindowSwitcherEnabled ?? appWindowSwitcherEnabled
+        if let m = s.appWindowSwitcherModifiers {
+            appWindowSwitcherModifier = SwitcherModifier(flags: NSEvent.ModifierFlags(rawValue: m), default: .option)
+        }
+        windowScope = s.windowScope.flatMap(WindowScope.init(rawValue:)) ?? windowScope
+        includeMinimizedWindows = s.includeMinimizedWindows ?? includeMinimizedWindows
+        includeHiddenAppWindows = s.includeHiddenAppWindows ?? includeHiddenAppWindows
+        windowSwitcherScale = s.windowSwitcherScale ?? windowSwitcherScale
+        barSizeScale = s.barSizeScale ?? barSizeScale
+        barOpacity = s.barOpacity ?? barOpacity
+        borderWidth = s.borderWidth ?? borderWidth
+        verticalPosition = s.verticalPosition.flatMap(BarVerticalPosition.init(rawValue:)) ?? verticalPosition
+        horizontalPosition = s.horizontalPosition.flatMap(BarHorizontalPosition.init(rawValue:)) ?? horizontalPosition
+        silentApps = s.silentApps ?? silentApps
+        usageCount = s.usageCount ?? usageCount
+        usageByDay = s.usageByDay ?? usageByDay
+        welcomeShown = s.welcomeShown ?? welcomeShown
+        showStatusIcon = s.showStatusIcon ?? showStatusIcon
+        autoUpdateCheck = s.autoUpdateCheck ?? autoUpdateCheck
     }
 
-    // MARK: Profile mutations
+    /// Drops bindings that can't be typed (older builds recorded Esc / Tab as
+    /// a "character") and duplicate keys (first one wins). A character that
+    /// can't be mapped to a key on this layout is kept as-is (the shared config
+    /// may come from a Mac with another layout); the UI flags it.
+    static func sanitized(_ list: [AppEntry]) -> [AppEntry] {
+        var used = Set<UInt16>()
+        return list.map { entry in
+            var e = entry
+            guard let ch = e.character else { e.keyCode = nil; return e }
+            let printable = !ch.isEmpty && ch.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0) && !CharacterSet.whitespaces.contains($0)
+            }
+            guard printable else { e.character = nil; e.keyCode = nil; return e }
+            guard let code = e.triggerKeyCode else { return e }
+            if used.contains(code) {
+                e.character = nil
+                e.keyCode = nil
+            } else {
+                used.insert(code)
+                e.keyCode = code
+            }
+            return e
+        }
+    }
+
+    // MARK: Migration from ≤ 1.1 profiles
+    /// Dock / Switcher / multiple custom profiles collapse into one app list:
+    /// the active custom profile wins; a Dock profile becomes its Dock apps.
+    static func migrate(profiles: [LegacyProfile], activeID: UUID?) -> [AppEntry] {
+        let sorted = profiles.sorted { $0.sortOrder < $1.sortOrder }
+        let active = sorted.first { $0.id == activeID } ?? sorted.first
+        if let active, active.mode == "custom", !active.actions.isEmpty {
+            return active.actions
+        }
+        if let active, active.mode == "dock" {
+            return dockEntries(includeFinder: active.includeFinder, characters: active.characters)
+        }
+        if let custom = sorted.first(where: { $0.mode == "custom" && !$0.actions.isEmpty }) {
+            return custom.actions
+        }
+        return dockEntries(includeFinder: true, characters: active?.characters ?? "1234567890")
+    }
+
+    static func dockEntries(includeFinder: Bool, characters: String = "1234567890") -> [AppEntry] {
+        var urls: [URL] = []
+        if includeFinder { urls.append(DockReader.finderURL) }
+        urls.append(contentsOf: DockReader.apps().map(\.url).filter { $0.path != DockReader.finderURL.path })
+        let chars = Array(characters.lowercased()).map(String.init)
+        return urls.enumerated().map { i, url in
+            AppEntry.make(url: url, character: i < chars.count ? chars[i] : nil)
+        }
+    }
+
+    // MARK: App list mutations
+    func containsApp(path: String) -> Bool {
+        apps.contains { $0.path == path }
+    }
+
+    /// Appends apps that aren't in the list yet, each with the next free key.
+    func addApps(_ urls: [URL]) {
+        var list = apps
+        for url in urls where url.pathExtension == "app" && !list.contains(where: { $0.path == url.path }) {
+            list.append(AppEntry.make(url: url, character: Self.nextFreeCharacter(in: list)))
+        }
+        apps = list
+    }
+
+    static func nextFreeCharacter(in list: [AppEntry]) -> String? {
+        let used = Set(list.compactMap(\.triggerKeyCode))
+        return KeyCodes.assignmentOrder.first { ch in
+            guard let code = KeyCodes.code(for: ch) else { return false }
+            return !used.contains(code)
+        }
+    }
+
+    /// Re-assign 1…0, Q…P… from top to bottom.
+    func reassignKeys() {
+        var list = apps
+        for i in list.indices {
+            let ch = i < KeyCodes.assignmentOrder.count ? KeyCodes.assignmentOrder[i] : nil
+            list[i].character = ch
+            list[i].keyCode = ch.flatMap { KeyCodes.code(for: $0) }
+        }
+        apps = list
+    }
+
+    func clearKeys() {
+        var list = apps
+        for i in list.indices { list[i].character = nil; list[i].keyCode = nil }
+        apps = list
+    }
+
+    /// Binds a key to an app. If another app had it, that app loses it and its
+    /// name is returned so the UI can say so.
     @discardableResult
-    func addProfile(mode: AppMode) -> Profile {
-        let order = (profiles.map(\.sortOrder).max() ?? -1) + 1
-        let name: String
-        switch mode {
-        case .dock: name = "Dock"
-        case .switcher: name = "Switcher"
-        case .custom: name = "自定义配置 \(profiles.filter { $0.mode == .custom }.count + 1)"
+    func bind(appID: UUID, keyCode: UInt16?, character: String?) -> String? {
+        var list = apps
+        guard let target = list.firstIndex(where: { $0.id == appID }) else { return nil }
+        var displaced: String?
+        if let keyCode {
+            for i in list.indices where list[i].id != appID && list[i].triggerKeyCode == keyCode {
+                displaced = list[i].name
+                list[i].character = nil
+                list[i].keyCode = nil
+            }
         }
-        let p = Profile(name: name, mode: mode, sortOrder: order)
-        profiles.append(p)
-        return p
+        list[target].character = character
+        list[target].keyCode = keyCode
+        apps = list
+        return displaced
     }
 
-    func duplicate(_ profile: Profile) {
-        var p = profile
-        p.id = UUID()
-        p.name = profile.name + " 副本"
-        p.sortOrder = (profiles.map(\.sortOrder).max() ?? -1) + 1
-        profiles.append(p)
-    }
-
-    func delete(_ profile: Profile) {
-        guard profiles.count > 1 else { return }
-        profiles.removeAll { $0.id == profile.id }
-        if activeProfileID == profile.id {
-            activeProfileID = profiles.sorted { $0.sortOrder < $1.sortOrder }.first?.id
-        }
-    }
-
+    // MARK: Misc
     func silentEntry(for bundleID: String) -> SilentEntry? {
         silentApps.first { $0.bundleID == bundleID }
     }
 
-    func recordActivation(_ bundleID: String) {
+    /// App activation (any source): feeds the MRU order only.
+    func noteActivated(_ bundleID: String) {
         mruBundleIDs.removeAll { $0 == bundleID }
         mruBundleIDs.insert(bundleID, at: 0)
-        if mruBundleIDs.count > 50 { mruBundleIDs = Array(mruBundleIDs.prefix(50)) }
+        if mruBundleIDs.count > 64 { mruBundleIDs.removeLast(mruBundleIDs.count - 64) }
+    }
+
+    /// A switch performed through SwitchMux (App Bar or window switcher).
+    func recordUsage() {
         usageCount += 1
         let key = Self.dayFormatter.string(from: Date())
         usageByDay[key, default: 0] += 1

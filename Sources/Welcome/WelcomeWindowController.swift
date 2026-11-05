@@ -63,8 +63,8 @@ private struct WelcomeView: View {
             Text("欢迎使用 SwitchMux")
                 .font(.system(size: 20, weight: .semibold))
             VStack(spacing: 4) {
-                Text("按住 ⌥ Option 键并按下数字键，开始使用 SwitchMux。")
-                Text("再按一次数字键可隐藏当前应用；按住 Option 悬停后松开也能切换。")
+                Text("按住 ⌥ Option 再按数字键，打开或切换到对应应用。")
+                Text("⌘Tab 浏览所有窗口的缩略图，⌥` 在同一应用的多个窗口间切换。")
                     .foregroundStyle(.secondary)
             }
             .multilineTextAlignment(.center)
@@ -106,7 +106,7 @@ private struct WelcomeView: View {
             }
             .keyboardShortcut(.defaultAction)
             .controlSize(.large)
-            Text("可以稍后在「设置 → 高级」中修改激活键。")
+            Text("可以在「设置 → 应用」中增删应用、修改按键。")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             Spacer()

@@ -29,7 +29,7 @@ final class WindowCardView: NSView {
         layer?.cornerRadius = 12
         layer?.cornerCurve = .continuous
 
-        thumbnailView.imageScaling = .scaleAxesIndependently
+        thumbnailView.imageScaling = .scaleProportionallyUpOrDown
         thumbnailView.wantsLayer = true
         thumbnailView.layer?.cornerRadius = 10
         thumbnailView.layer?.cornerCurve = .continuous
@@ -126,14 +126,20 @@ final class WindowCardView: NSView {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                                   owner: self, userInfo: nil)
         addTrackingArea(area)
         tracking = area
     }
 
     override func mouseEntered(with event: NSEvent) {
-        isSelected = true
+        // The controller decides whether hover changes the selection.
+        onHoverChanged?(true)
+    }
+
+    // Entering happens before the first move when the panel appears under a
+    // resting cursor; report movement too so hover-select still works.
+    override func mouseMoved(with event: NSEvent) {
         onHoverChanged?(true)
     }
 

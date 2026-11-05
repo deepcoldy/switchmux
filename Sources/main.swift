@@ -1,5 +1,13 @@
 import AppKit
 
+// Watchdog mode: a tiny child that restores system ⌘Tab if SwitchMux is
+// killed without a chance to clean up (see NativeCommandTab).
+let launchArgs = CommandLine.arguments
+if let i = launchArgs.firstIndex(of: NativeCommandTab.watchdogFlag),
+   i + 1 < launchArgs.count, let parent = pid_t(launchArgs[i + 1]) {
+    NativeCommandTab.runWatchdog(parent: parent)
+}
+
 // Single-instance guard. Launching the bundled binary directly (bypassing
 // Launch Services, which already dedupes `open`) would create a second status
 // item and a competing event tap. Only treat another LIVE copy of the SAME

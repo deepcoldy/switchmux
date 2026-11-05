@@ -7,6 +7,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A crashed earlier instance may have left system ⌘Tab disabled;
+        // make sure it comes back however we exit.
+        if ProcessInfo.processInfo.environment["SWITCHMUX_NO_HOTKEYS"] == nil {
+            NativeCommandTab.forceRestore()
+            NativeCommandTab.installCrashGuards()
+        }
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 1.0)
+        _ = AppsMonitor.shared
+
         // Status bar item
         statusBar = StatusBarController()
         statusBar?.refresh()
@@ -34,12 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PermissionWatcher.shared.changePublisher
             .receive(on: RunLoop.main)
             .sink { trusted in
-                if trusted {
-                    HotkeyController.shared.rebuildTap()
-                    HotkeyController.shared.showToast("SwitchMux 已就绪")
-                } else {
-                    HotkeyController.shared.rebuildTap()
-                }
+                HotkeyController.shared.rebuildTap()
+                if trusted { HotkeyController.shared.showToast("SwitchMux 已就绪") }
             }
             .store(in: &cancellables)
         PermissionWatcher.shared.start()
@@ -57,39 +62,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Auto-update checks (daily, with launch jitter); no UI unless a
         // downloadable release is found.
         UpdateChecker.shared.start()
-
-        // Debug hook: SWITCHMUX_KEYTEST=1 shows the bar via synthetic Option and
-        // posts Option+1 from inside the (Accessibility-trusted) app process.
-        if ProcessInfo.processInfo.environment["SWITCHMUX_KEYTEST"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                func post(_ key: CGKeyCode, down: Bool, flags: CGEventFlags = .maskAlternate) {
-                    let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState),
-                                    virtualKey: key, keyDown: down)!
-                    e.flags = flags
-                    e.post(tap: .cghidEventTap)
-                }
-                post(0x3A, down: true)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { post(18, down: true) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { post(18, down: false) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { post(0x3A, down: false) }
-            }
-        }
-
-        // Debug hook: SWITCHMUX_TRUST_CYCLE=1 simulates revoke→grant and logs
-        // whether the event tap is rebuilt without restarting the app.
-        if ProcessInfo.processInfo.environment["SWITCHMUX_TRUST_CYCLE"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                NSLog("TRUSTCYCLE tap active at start: \(HotkeyController.shared.tapActive)")
-                PermissionWatcher.shared.debugSimulateChange(false)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    NSLog("TRUSTCYCLE tap active after revoke: \(HotkeyController.shared.tapActive)")
-                    PermissionWatcher.shared.debugSimulateChange(true)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        NSLog("TRUSTCYCLE tap active after grant: \(HotkeyController.shared.tapActive)")
-                    }
-                }
-            }
-        }
 
         // Debug hook: SWITCHMUX_SMOKE=/tmp/out.png shows the bar and rasterizes it.
         if let dumpPath = ProcessInfo.processInfo.environment["SWITCHMUX_SMOKE"] {
@@ -126,43 +98,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Debug hook: SWITCHMUX_WINTEST=1 verifies the Cmd-Tab chord: Cmd alone
-        // and Cmd+C must not show the switcher; Cmd+Tab must.
-        if ProcessInfo.processInfo.environment["SWITCHMUX_WINTEST"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                func post(_ key: CGKeyCode, down: Bool, flags: CGEventFlags = []) {
-                    let e = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState),
-                                    virtualKey: key, keyDown: down)!
-                    e.flags = flags
-                    e.post(tap: .cghidEventTap)
-                }
-                NSLog("WINTEST start visible=\(WindowSwitcherController.shared.isVisible)")
-                post(0x37, down: true, flags: .maskCommand)        // Cmd down
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    NSLog("WINTEST cmd-only visible=\(WindowSwitcherController.shared.isVisible)")
-                    post(8, down: true, flags: .maskCommand)        // C down (Cmd+C)
-                    post(8, down: false, flags: .maskCommand)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    NSLog("WINTEST cmd+c visible=\(WindowSwitcherController.shared.isVisible)")
-                    post(48, down: true, flags: .maskCommand)       // Tab down (Cmd+Tab)
-                    post(48, down: false, flags: .maskCommand)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-                    NSLog("WINTEST cmd+tab visible=\(WindowSwitcherController.shared.isVisible) windows=\(WindowSwitcherController.shared.itemsCount)")
-                    post(0x37, down: false)                          // Cmd up
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
-                    NSLog("WINTEST after release visible=\(WindowSwitcherController.shared.isVisible)")
-                }
-            }
-        }
-
         // Debug hook: SWITCHMUX_SMOKE_WINDOWS=/tmp/out.png renders the switcher.
         if let path = ProcessInfo.processInfo.environment["SWITCHMUX_SMOKE_WINDOWS"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                WindowSwitcherController.shared.show()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                WindowSwitcherController.shared.smokeShow()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     WindowSwitcherController.shared.smokeDump(to: path)
                 }
             }
@@ -190,6 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        HotkeyController.shared.shutdown()
     }
 
     // Launching SwitchMux again (e.g. from Finder with no status icon) opens settings.

@@ -27,13 +27,20 @@ final class ConfigSync {
 
     /// iCloud Drive folder (may not exist if the user never enabled iCloud Drive).
     private var iCloudDirectory: URL? {
+        if overrideDirectory != nil { return nil }
         let url = home
             .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
             .appendingPathComponent(directoryName)
         return FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path) ? url : nil
     }
 
+    /// SWITCHMUX_CONFIG_DIR redirects all reads/writes (smoke tests, dev
+    /// builds) so they never touch the user's real synced config.
+    private let overrideDirectory: URL? = ProcessInfo.processInfo.environment["SWITCHMUX_CONFIG_DIR"]
+        .map { URL(fileURLWithPath: $0, isDirectory: true) }
+
     private var localDirectory: URL {
+        if let overrideDirectory { return overrideDirectory }
         let fm = FileManager.default
         let base = (try? fm.url(for: .applicationSupportDirectory,
                                 in: .userDomainMask, appropriateFor: nil, create: true))
@@ -51,7 +58,8 @@ final class ConfigSync {
     }
 
     var locationDescription: String {
-        iCloudDirectory != nil ? "iCloud 云盘（自动多设备同步）" : "本地（未检测到 iCloud Drive）"
+        if overrideDirectory != nil { return "自定义目录（SWITCHMUX_CONFIG_DIR）" }
+        return iCloudDirectory != nil ? "iCloud 云盘（自动多设备同步）" : "本地（未检测到 iCloud Drive）"
     }
 
     // MARK: Load / save
@@ -120,7 +128,6 @@ final class ConfigSync {
 
     private func externalChange() {
         guard !saving else { return }
-        let fm = FileManager.default
         guard let data = try? Data(contentsOf: primaryURL), data != lastData else { return }
         lastData = data
         onChange?()

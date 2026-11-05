@@ -23,12 +23,6 @@ enum PrefsSupport {
         return response == .OK ? panel.urls : []
     }
 
-    static func makeAction(url: URL, character: String? = nil) -> ProfileAction {
-        let name = url.deletingPathExtension().lastPathComponent
-        let bid = Bundle(url: url)?.bundleIdentifier
-        return ProfileAction(name: name, path: url.path, bundleID: bid, character: character)
-    }
-
     struct RunningApp {
         let name: String
         let bundleID: String?
@@ -115,50 +109,75 @@ enum PrefsSupport {
     }
 }
 
-/// Records one key press while the preferences window is key.
+/// Records one key press for an app's trigger while the preferences window is key.
+/// Esc cancels, Delete clears the binding.
 final class ShortcutRecorder: ObservableObject {
     static let shared = ShortcutRecorder()
-    @Published var recordingActionID: UUID?
-    @Published var conflictMessage: String?
+    @Published var recordingAppID: UUID?
+    @Published var message: String?
 
     private var monitor: Any?
-    private var profileID: UUID?
 
-    func startRecording(for actionID: UUID, profileID: UUID) {
-        recordingActionID = actionID
-        self.profileID = profileID
-        conflictMessage = nil
-        if let monitor { NSEvent.removeMonitor(monitor) }
+    func toggle(_ appID: UUID) {
+        if recordingAppID == appID { cancel() } else { start(appID) }
+    }
+
+    func start(_ appID: UUID) {
+        cancel()
+        recordingAppID = appID
+        message = nil
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            self.assign(event)
+            self.handle(event)
             return nil
         }
     }
 
     func cancel() {
-        recordingActionID = nil
+        recordingAppID = nil
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
     }
 
-    private func assign(_ event: NSEvent) {
-        guard let actionID = recordingActionID, let profileID else { cancel(); return }
+    private func handle(_ event: NSEvent) {
         let settings = SettingsStore.shared
-        guard let profile = settings.profile(profileID),
-              var copy = Optional(profile),
-              let idx = copy.actions.firstIndex(where: { $0.id == actionID }) else {
+        guard let appID = recordingAppID, settings.apps.contains(where: { $0.id == appID }) else {
             cancel()
             return
         }
-        let ch = event.charactersIgnoringModifiers?.lowercased() ?? ""
-        if !ch.isEmpty, let conflict = copy.actions.first(where: { $0.character == ch && $0.id != actionID }) {
-            conflictMessage = "「\(ch.uppercased())」已被「\(conflict.name)」使用，请先移除或修改另一个快捷键。"
+        switch event.keyCode {
+        case KeyCodes.escape:
             cancel()
             return
+        case KeyCodes.delete, KeyCodes.forwardDelete:
+            settings.bind(appID: appID, keyCode: nil, character: nil)
+            cancel()
+            return
+        case KeyCodes.tab, KeyCodes.returnKey, KeyCodes.enter, KeyCodes.space,
+             KeyCodes.left, KeyCodes.right, KeyCodes.up, KeyCodes.down:
+            message = "这个键不能用作快捷键，请换一个字母、数字或符号键。"
+            return
+        default:
+            break
         }
-        copy.actions[idx].character = ch.isEmpty ? nil : ch
-        settings.update(copy)
+        // With the same modifier, ⌥` (key above Tab) belongs to window switching.
+        if event.keyCode == KeyCodes.keyAboveTab, settings.appWindowSwitcherEnabled,
+           settings.appWindowSwitcherModifier.flags == settings.activateModifiers {
+            message = "\(settings.appWindowSwitcherModifier.symbol)` 已用于在同一应用的窗口间切换，请换一个键。"
+            return
+        }
+        let raw = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        let printable = raw.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+            && !raw.unicodeScalars.contains { (0xF700...0xF8FF).contains($0.value) } // function keys
+        guard let ch = (printable && !raw.isEmpty ? raw : nil) ?? KeyCodes.character(for: event.keyCode) else {
+            message = "这个键不能用作快捷键，请换一个字母、数字或符号键。"
+            return
+        }
+        if let displaced = settings.bind(appID: appID, keyCode: event.keyCode, character: ch) {
+            message = "「\(ch.uppercased())」原先属于「\(displaced)」，已改为分配给当前应用。"
+        } else {
+            message = nil
+        }
         cancel()
     }
 }
@@ -177,12 +196,51 @@ extension View {
 /// Small rounded key-cap badge like the one on the App Bar.
 struct KeyBadge: View {
     let text: String
+    var wide = false
+    var dimmed = false
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(minWidth: 22, minHeight: 19)
-            .padding(.horizontal, 3)
-            .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(dimmed ? Color.secondary : Color.white)
+            .frame(minWidth: wide ? 26 : 22, minHeight: 20)
+            .padding(.horizontal, 4)
+            .background(dimmed ? Color.secondary.opacity(0.15) : Color.black.opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// Row of key-cap toggles for picking one or more modifier keys.
+struct ModifierPicker: View {
+    @Binding var flags: NSEvent.ModifierFlags
+
+    private let options: [(String, String, NSEvent.ModifierFlags)] = [
+        ("⌃", "Control", .control), ("⌥", "Option", .option),
+        ("⇧", "Shift", .shift), ("⌘", "Command", .command),
+    ]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(options, id: \.1) { symbol, name, flag in
+                let on = flags.contains(flag)
+                Button {
+                    var next = flags
+                    if on { next.remove(flag) } else { next.insert(flag) }
+                    // Never allow an empty mask, and never Shift alone.
+                    let relevant = next.intersection(KeyChord.relevant)
+                    if !relevant.isEmpty && relevant != .shift { flags = relevant }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(symbol).font(.system(size: 13, weight: .semibold))
+                        Text(name).font(.system(size: 11))
+                    }
+                    .padding(.horizontal, 9)
+                    .frame(height: 24)
+                    .foregroundStyle(on ? Color.white : Color.primary)
+                    .background(on ? Color.accentColor : Color.secondary.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 }
