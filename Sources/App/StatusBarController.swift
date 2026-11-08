@@ -103,6 +103,13 @@ final class StatusBarController: NSObject {
         checkUpdatesItem.target = self
         menu.addItem(checkUpdatesItem)
 
+        if ConfigSync.shared.usesICloud {
+            let syncItem = NSMenuItem(title: "从 iCloud 获取最新配置", action: #selector(refreshFromCloud),
+                                      keyEquivalent: "")
+            syncItem.target = self
+            menu.addItem(syncItem)
+        }
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "退出 SwitchMux", action: #selector(quit), keyEquivalent: "q")
@@ -148,6 +155,13 @@ final class StatusBarController: NSObject {
     @objc private func checkForUpdates() {
         PreferencesWindowController.shared.showWindow(.about)
         UpdateChecker.shared.checkNow(mode: .manual)
+    }
+
+    @objc private func refreshFromCloud() {
+        HotkeyController.shared.showToast("正在从 iCloud 获取最新配置…")
+        ConfigSync.shared.refreshFromCloud { outcome in
+            HotkeyController.shared.showToast(outcome.message)
+        }
     }
 
     @objc private func installUpdate() {

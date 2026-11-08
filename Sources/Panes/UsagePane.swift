@@ -33,7 +33,7 @@ final class UsagePaneModel: ObservableObject {
 }
 
 struct UsagePane: View {
-    @EnvironmentObject var settings: SettingsStore
+    @ObservedObject private var usage = UsageStore.shared
     @StateObject private var model = UsagePaneModel()
 
     private var range: UsageRange {
@@ -47,7 +47,7 @@ struct UsagePane: View {
     private var dailyCounts: [(day: Date, count: Int)] {
         var result: [(Date, Int)] = []
         if range == .all {
-            let items = settings.usageByDay.map { (SettingsStore.dayFormatter.date(from: $0.key) ?? Date(), $0.value) }
+            let items = usage.byDay.map { (SettingsStore.dayFormatter.date(from: $0.key) ?? Date(), $0.value) }
             return items.sorted { $0.0 < $1.0 }.map { ($0.0, $0.1) }
         }
         guard let days = range.days else { return [] }
@@ -55,7 +55,7 @@ struct UsagePane: View {
         for offset in stride(from: days - 1, through: 0, by: -1) {
             let day = calendar.date(byAdding: .day, value: -offset, to: today)!
             let key = SettingsStore.dayFormatter.string(from: day)
-            result.append((day, settings.usageByDay[key] ?? 0))
+            result.append((day, usage.byDay[key] ?? 0))
         }
         return result.map { ($0.0, $0.1) }
     }
@@ -82,7 +82,7 @@ struct UsagePane: View {
             HStack(spacing: 32) {
                 stat(title: "总次数", value: "\(total)")
                 stat(title: "日均", value: "\(average)")
-                stat(title: "累计", value: "\(settings.usageCount)")
+                stat(title: "累计", value: "\(usage.total)")
             }
             .padding(.horizontal, 20)
 
@@ -95,6 +95,7 @@ struct UsagePane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
+        .onAppear { usage.reload() }
     }
 
     private func stat(title: String, value: String) -> some View {

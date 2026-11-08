@@ -4,10 +4,22 @@ import SwiftUI
 final class GeneralPaneModel: ObservableObject {
     @Published var trusted = PrefsSupport.accessibilityTrusted
     @Published var launchAtLogin = SettingsStore.shared.launchAtLogin
+    @Published var refreshing = false
+    @Published var refreshResult: String?
+
+    func refreshFromCloud() {
+        refreshing = true
+        refreshResult = nil
+        ConfigSync.shared.refreshFromCloud { [weak self] outcome in
+            self?.refreshing = false
+            self?.refreshResult = outcome.message
+        }
+    }
 }
 
 struct GeneralPane: View {
     @EnvironmentObject var settings: SettingsStore
+    @ObservedObject private var sync = ConfigSync.shared
     @StateObject private var model = GeneralPaneModel()
 
     var body: some View {
@@ -50,12 +62,8 @@ struct GeneralPane: View {
                 Button("重新查看欢迎页") {
                     WelcomeWindowController.shared.showWindow()
                 }
-                LabeledContent("配置同步") {
-                    Text(ConfigSync.shared.locationDescription)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
+            syncSection
             Section {
                 Text("SwitchMux \(AppInfo.shortVersion)（应用与窗口快速切换器）")
                     .font(.caption)
@@ -66,6 +74,64 @@ struct GeneralPane: View {
         .onAppear {
             model.trusted = PrefsSupport.accessibilityTrusted
             model.launchAtLogin = settings.launchAtLogin
+            if sync.usesICloud { sync.requestSync() }
         }
+    }
+
+    private var syncSection: some View {
+        Section("配置同步") {
+            LabeledContent("位置") {
+                Text(sync.locationDescription).foregroundStyle(.secondary)
+            }
+            if sync.usesICloud {
+                LabeledContent("状态") {
+                    HStack(spacing: 6) {
+                        if sync.phase == .syncing { ProgressView().controlSize(.small) }
+                        Text(syncStatus.text)
+                            .foregroundStyle(syncStatus.warning ? Color.orange : Color.secondary)
+                    }
+                }
+                if let edit = sync.lastEdit {
+                    LabeledContent("最近修改") {
+                        Text([Self.format(edit.date), edit.device].compactMap { $0 }.joined(separator: " · "))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Button("从 iCloud 获取最新配置") { model.refreshFromCloud() }
+                        .disabled(model.refreshing)
+                    if let result = model.refreshResult {
+                        Text(result).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if FileManager.default.fileExists(atPath: sync.backupDirectory.path) {
+                        Button("显示备份") { NSWorkspace.shared.open(sync.backupDirectory) }
+                    }
+                }
+                if let writer = sync.olderBuildWriter {
+                    Text("iCloud 中的配置最近由旧版 SwitchMux（\(writer)）写入。旧版会覆盖其他 Mac 的修改，请把所有 Mac 更新到最新版。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var syncStatus: (text: String, warning: Bool) {
+        switch sync.phase {
+        case .localOnly: return ("仅本机", false)
+        case .syncing: return ("正在同步…", false)
+        case .waiting(let reason): return (reason, false)
+        case .failed(let reason): return ("同步失败：\(reason)", true)
+        case .idle:
+            guard let date = sync.lastSynced else { return ("等待同步", false) }
+            return ("已同步（\(Self.format(date))）", false)
+        }
+    }
+
+    private static func format(_ date: Date) -> String {
+        Calendar.current.isDateInToday(date)
+            ? date.formatted(date: .omitted, time: .shortened)
+            : date.formatted(date: .abbreviated, time: .shortened)
     }
 }

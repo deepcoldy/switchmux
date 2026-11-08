@@ -169,7 +169,7 @@ final class WindowSwitcherController {
 
     private func activate(_ item: WindowItem) {
         WindowActions.activate(item)
-        SettingsStore.shared.recordUsage()
+        UsageStore.shared.record()
     }
 
     private func wrap(_ i: Int, count: Int) -> Int {

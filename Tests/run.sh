@@ -11,5 +11,9 @@ swiftc -swift-version 5 \
   "$ROOT"/Sources/Services/HotkeyEventTap.swift \
   "$ROOT"/Tests/ModelTests/main.swift \
   -o "$OUT/model-tests"
-mkdir -p "$OUT/config"
-SWITCHMUX_CONFIG_DIR="$OUT/config" "$OUT/model-tests"
+# One process per scenario: the stores load their config once per launch.
+for scenario in main upgrade seed usage; do
+  mkdir -p "$OUT/$scenario/config"
+  SWITCHMUX_TEST_SCENARIO="$scenario" SWITCHMUX_CONFIG_DIR="$OUT/$scenario/config" \
+    SWITCHMUX_CLOUD_DIR="$OUT/$scenario/cloud" "$OUT/model-tests"
+done

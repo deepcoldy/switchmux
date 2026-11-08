@@ -315,7 +315,7 @@ final class AppBarController {
 
     private func trigger(_ slot: Slot) {
         AppActivator.trigger(slot, allowHide: SettingsStore.shared.hideOnRepeat)
-        SettingsStore.shared.recordUsage()
+        UsageStore.shared.record()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             self?.reloadIfVisible()
         }

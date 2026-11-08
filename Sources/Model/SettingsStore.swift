@@ -92,6 +92,8 @@ final class SettingsStore: ObservableObject {
 
     // MARK: Silent / misc
     @Published var silentApps: [SilentEntry]
+    /// Switch counts kept in the config by builds up to 1.2.1 (which still
+    /// update them). Newer builds count per Mac, see `UsageStore`.
     @Published var usageCount: Int
     @Published var usageByDay: [String: Int]
     @Published var welcomeShown: Bool
@@ -151,38 +153,64 @@ final class SettingsStore: ObservableObject {
         showStatusIcon = true
         autoUpdateCheck = true
 
-        if let snap = ConfigSync.shared.load(SettingsSnapshot.self) {
+        let sync = ConfigSync.shared
+        sync.seedNeutralKeys = ["welcomeShown"]
+        sync.derivedKeys = ["profiles": "apps", "activeProfileID": "apps",
+                            "switcherFilter": "apps", "mruBundleIDs": "apps"]
+        if let snap = sync.load(SettingsSnapshot.self) {
             apply(snap)
-            if needsMigrationSave { scheduleSave() }
+            saveMigration()
         } else {
-            // First run: start from the Dock with Finder first.
+            // First run: start from the Dock with Finder first, until iCloud
+            // delivers the config of the user's other Macs (if any).
             apps = Self.dockEntries(includeFinder: true)
-            scheduleSave()
+            sync.seed(snapshot())
         }
 
         objectWillChange
             .sink { [weak self] in self?.scheduleSave() }
             .store(in: &observerBag)
 
-        ConfigSync.shared.onChange = { [weak self] in
-            guard let self,
-                  let snap = ConfigSync.shared.load(SettingsSnapshot.self) else { return }
+        sync.onChange = { [weak self] in
+            guard let self, let snap = ConfigSync.shared.load(SettingsSnapshot.self) else { return }
+            // The objectWillChange sink runs synchronously, so this covers apply().
             self.applyingExternal = true
             self.apply(snap)
-            DispatchQueue.main.async { self.applyingExternal = false }
+            self.applyingExternal = false
+            // After the sync that delivered it has finished.
+            DispatchQueue.main.async { self.saveMigration() }
         }
-        ConfigSync.shared.watch()
+        sync.flushPendingEdits = { [weak self] in self?.flushPendingSave() }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.flushPendingSave()
+            }
+        sync.start()
     }
 
     private func scheduleSave() {
         guard !applyingExternal else { return }
         saveWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            ConfigSync.shared.save(self.snapshot())
-        }
+        let work = DispatchWorkItem { [weak self] in self?.flushPendingSave() }
         saveWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// Stores the app list derived from an older build's `profiles`, so every
+    /// Mac gets it as `apps`. Not an edit: it keeps the times it came with.
+    private func saveMigration() {
+        guard needsMigrationSave else { return }
+        needsMigrationSave = false
+        flushPendingSave()
+        ConfigSync.shared.save(snapshot(), edit: false)
+    }
+
+    /// Saves an edit still waiting for its debounce right away.
+    func flushPendingSave() {
+        guard let work = saveWorkItem else { return }
+        work.cancel()
+        saveWorkItem = nil
+        ConfigSync.shared.save(snapshot())
     }
 
     func snapshot() -> SettingsSnapshot {
@@ -227,7 +255,12 @@ final class SettingsStore: ObservableObject {
 
     private func apply(_ s: SettingsSnapshot) {
         if let a = s.apps {
-            apps = Self.sanitized(a)
+            if let edited = Self.legacyEdit(s, apps: a) {
+                apps = Self.sanitized(edited)
+                needsMigrationSave = true
+            } else {
+                apps = Self.sanitized(a)
+            }
         } else if let profiles = s.profiles, !profiles.isEmpty {
             apps = Self.sanitized(Self.migrate(profiles: profiles, activeID: s.activeProfileID))
             needsMigrationSave = true
@@ -311,6 +344,28 @@ final class SettingsStore: ObservableObject {
         return dockEntries(includeFinder: true, characters: active?.characters ?? "1234567890")
     }
 
+    /// Builds ≤ 1.1 only edit `profiles` and drop `apps`, which the merge then
+    /// keeps from before. If the profile no longer lists the same apps and keys
+    /// as `apps`, the list was edited there: returns that list.
+    static func legacyEdit(_ s: SettingsSnapshot, apps: [AppEntry]) -> [AppEntry]? {
+        let sorted = (s.profiles ?? []).sorted { $0.sortOrder < $1.sortOrder }
+        guard let active = sorted.first(where: { $0.id == s.activeProfileID }) ?? sorted.first else { return nil }
+        // An emptied list is kept, not replaced by the Dock as in `migrate`.
+        let edited = active.mode == "custom" ? active.actions
+            : migrate(profiles: sorted, activeID: active.id)
+        func bindings(_ list: [AppEntry]) -> [[String?]] { list.map { [$0.path, $0.character] } }
+        guard bindings(edited) != bindings(apps) else { return nil }
+        // Those builds drop `keyCode`: keep it where the binding is unchanged
+        // (it can come from a Mac with another keyboard layout).
+        return edited.map { entry in
+            var e = entry
+            if let same = apps.first(where: { $0.path == e.path && $0.character == e.character }) {
+                e.keyCode = same.keyCode
+            }
+            return e
+        }
+    }
+
     static func dockEntries(includeFinder: Bool, characters: String = "1234567890") -> [AppEntry] {
         var urls: [URL] = []
         if includeFinder { urls.append(DockReader.finderURL) }
@@ -390,13 +445,6 @@ final class SettingsStore: ObservableObject {
         mruBundleIDs.removeAll { $0 == bundleID }
         mruBundleIDs.insert(bundleID, at: 0)
         if mruBundleIDs.count > 64 { mruBundleIDs.removeLast(mruBundleIDs.count - 64) }
-    }
-
-    /// A switch performed through SwitchMux (App Bar or window switcher).
-    func recordUsage() {
-        usageCount += 1
-        let key = Self.dayFormatter.string(from: Date())
-        usageByDay[key, default: 0] += 1
     }
 
     static let dayFormatter: DateFormatter = {
